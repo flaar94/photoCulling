@@ -2,7 +2,6 @@ from PIL import Image, ExifTags
 from pathlib import Path
 import itertools
 import datetime
-import numpy as np
 import torch
 import torchvision.models as models
 import torchvision.transforms as transforms
@@ -13,15 +12,14 @@ from collections.abc import Iterable
 import argparse
 import pandas as pd
 
-SIMILARITY_THRESHOLD = 0.3
-TIME_THRESHOLD_MIN = 10
-
 
 class TypedNamespace(argparse.Namespace):
     image_path: str
     model_path: str
     predictions: str
     score_only: bool
+    similarity_threshold: float
+    time_threshold: int
 
 
 def get_parser():
@@ -31,8 +29,13 @@ def get_parser():
                         help='path to pretrained model')
     parser.add_argument('--prediction_path', type=str, default="predictions",
                         help='output directory to store predictions')
-    parser.add_argument('--score_only', action='store_true', help='Whether to skip the culling step, and '
-                                                                  'instead only score the images')
+    parser.add_argument('--score_only', action='store_true',
+                        help='Whether to skip the culling step, and instead only score the images')
+    parser.add_argument('--similarity_threshold', type=float, default=0.3,
+                        help='Threshold for how similar two items need to be in order to group them ')
+    parser.add_argument("--time_threshold", type=int, default=10,
+                        help='In order to group two photos, the number of minutes between them must be less than this '
+                             'number')
     return parser
 
 
@@ -53,7 +56,6 @@ def score_paths(model: NIMA, image_paths: Iterable[Path]) -> dict[Path, float]:
 
     test_transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        # transforms.RandomCrop(224),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
@@ -76,15 +78,8 @@ def score_paths(model: NIMA, image_paths: Iterable[Path]) -> dict[Path, float]:
         std = std ** 0.5
 
         mean, std = float(mean), float(std)
-        msg = f'{img.stem} mean: {mean:.3f} | std: {std:.3f} \n'
         scores.append((img, mean))
 
-    # sort from highest to lowest
-    # scores.sort(key=lambda x: -x[1])
-
-    # Find highest scored images, then take one of them
-    # top_score = max(scores.values())
-    # top_images = [img for img, val in scores.items() if val == top_score]
     return dict(scores)
 
 
@@ -136,7 +131,7 @@ def extract_features(image_paths: Iterable[Path]) -> list[tuple[Path, datetime.d
     return data
 
 
-def group_by_features(data: Iterable[tuple[Path, datetime.datetime, torch.tensor]]) -> set[frozenset[Path]]:
+def group_by_features(data: Iterable[tuple[Path, datetime.datetime, torch.tensor]], time_threshold, similarity_threshold) -> set[frozenset[Path]]:
     """
     Determine pairs of items that are similar in time and VGG features
 
@@ -149,8 +144,8 @@ def group_by_features(data: Iterable[tuple[Path, datetime.datetime, torch.tensor
     similar_images = []
     all_connected_images = set()
     for (image_path1, datetime1, features1), (image_path2, datetime2, features2) in itertools.combinations(data, 2):
-        if abs(datetime1 - datetime2) < datetime.timedelta(minutes=30) and F.cosine_similarity(
-                features1.view(1, -1), features2.view(1, -1)).cpu().data > 0.3:
+        if abs(datetime1 - datetime2) <= datetime.timedelta(minutes=time_threshold) and F.cosine_similarity(
+                features1.view(1, -1), features2.view(1, -1)).cpu().data >= similarity_threshold:
             similar_images.append([image_path1, image_path2])
             all_connected_images |= {image_path1, image_path2}
 
@@ -167,7 +162,13 @@ def group_by_features(data: Iterable[tuple[Path, datetime.datetime, torch.tensor
     return groups
 
 
-def get_evaluation_model(weight_path):
+def get_evaluation_model(weight_path: Path | str) -> NIMA:
+    """
+    Sets up the model used to evaluate photo quality
+
+    :param weight_path: path to the filed containing the weights for the pretrained model
+    :return: the NIMA model with loaded weights
+    """
     base_model = models.vgg16(weights='VGG16_Weights.IMAGENET1K_V1')
     model = NIMA(base_model)
 
@@ -215,7 +216,8 @@ def main():
     if not args.score_only:
         path_date_features = extract_features(image_paths)
         print("Image features extracted, now grouping images")
-        groups = group_by_features(path_date_features)
+        groups = group_by_features(path_date_features,
+                                   time_threshold=args.time_threshold, similarity_threshold=args.similarity_threshold)
         print("Images successfully grouped")
         culled_unflattened = [group - {extract_top_scored(group, scores)} for group in groups]
         culled_images = frozenset.union(*culled_unflattened)
