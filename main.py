@@ -11,35 +11,39 @@ import copy
 from model.model import NIMA
 from collections.abc import Iterable
 import argparse
-
-MODEL = "model_weights/filtered_v2_epoch-15.pth"
+import pandas as pd
 
 SIMILARITY_THRESHOLD = 0.3
-TIME_THRESHOLD_MIN = 60
+TIME_THRESHOLD_MIN = 10
 
 
 class TypedNamespace(argparse.Namespace):
     image_path: str
-    model: str
+    model_path: str
     predictions: str
+    score_only: bool
 
 
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--image_path', type=str, required=True, help='path to file or folder containing images')
-    parser.add_argument('--model', type=str, default="model_weights/filtered_v2_epoch-15.pth",
+    parser.add_argument('--model_path', type=str, default="model_weights/filtered_v2_epoch-40.pth",
                         help='path to pretrained model')
-    parser.add_argument('--predictions', type=str, default="predictions", help='output file to store predictions')
+    parser.add_argument('--prediction_path', type=str, default="predictions",
+                        help='output directory to store predictions')
+    parser.add_argument('--score_only', action='store_true', help='Whether to skip the culling step, and '
+                                                                  'instead only score the images')
     return parser
 
 
-def score_group(model: NIMA, group: Iterable[Path]) -> tuple[Path, dict[Path, float]]:
+def score_paths(model: NIMA, image_paths: Iterable[Path]) -> dict[Path, float]:
     """
     Takes a collection of paths, and computes the predicted aesthetic score for each one, returning the predicted best
     image along with predicted scores for all images
 
     Args:
-        group: A collection of paths to images
+        model: A model which computes quality scores for images
+        image_paths: A collection of paths to images
 
     Returns: The path to the best image, and a dictionary mapping image paths to associated scores
 
@@ -55,7 +59,7 @@ def score_group(model: NIMA, group: Iterable[Path]) -> tuple[Path, dict[Path, fl
                              std=[0.229, 0.224, 0.225])
     ])
     scores = []
-    for i, img in enumerate(group):
+    for i, img in enumerate(image_paths):
         mean, std = 0.0, 0.0
         im = Image.open(img)
         im = im.convert('RGB')
@@ -76,12 +80,12 @@ def score_group(model: NIMA, group: Iterable[Path]) -> tuple[Path, dict[Path, fl
         scores.append((img, mean))
 
     # sort from highest to lowest
-    scores.sort(key=lambda x: -x[1])
+    # scores.sort(key=lambda x: -x[1])
 
     # Find highest scored images, then take one of them
     # top_score = max(scores.values())
     # top_images = [img for img, val in scores.items() if val == top_score]
-    return scores[0][0], dict(scores)
+    return dict(scores)
 
 
 def extract_features(image_paths: Iterable[Path]) -> list[tuple[Path, datetime.datetime, torch.tensor]]:
@@ -185,6 +189,10 @@ def get_evaluation_model(weight_path):
     return model
 
 
+def extract_top_scored(group: Iterable[Path], scores: dict[Path, float]) -> Path:
+    return max(group, key=lambda path: scores[path])
+
+
 def main():
     parser = get_parser()
     args = parser.parse_args(namespace=TypedNamespace())
@@ -195,14 +203,28 @@ def main():
                                        image_dir.glob("*.jpeg"),
                                        image_dir.glob("*.png")))
 
-    data = extract_features(image_paths)
-    groups = group_by_features(data)
+    model = get_evaluation_model(weight_path=args.model_path)
+    scores = score_paths(model, image_paths)
+    prediction_path = Path(args.prediction_path)
 
-    model = get_evaluation_model(weight_path=MODEL)
+    if not prediction_path.exists():
+        prediction_path.mkdir(parents=True)
+    pd.DataFrame(scores.items(), columns=["path", "score"]).to_csv(prediction_path / "scores.csv", index=False)
 
-    for group in groups:
-        top_image, scores = score_group(model, group)
-        print(f"top_image={top_image.name}, {scores=}")
+    if not args.score_only:
+        path_date_features = extract_features(image_paths)
+        groups = group_by_features(path_date_features)
+
+        culled_unflattened = [group - {extract_top_scored(group, scores)} for group in groups]
+        culled_images = frozenset.union(*culled_unflattened)
+        # We've restricted to groups of images, so we need to put back in the ungrouped images
+        kept_images = set(image_paths) - culled_images
+
+        with open(prediction_path / "kept_images.txt", "w") as f:
+            f.write("\n".join([kept_image.name for kept_image in kept_images]))
+
+        with open(prediction_path / "culled_images.txt", "w") as f:
+            f.write("\n".join([culled_image.name for culled_image in culled_images]))
 
     return 0
 
