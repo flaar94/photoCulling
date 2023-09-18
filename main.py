@@ -210,11 +210,13 @@ def main():
     if not prediction_path.exists():
         prediction_path.mkdir(parents=True)
     pd.DataFrame(scores.items(), columns=["path", "score"]).to_csv(prediction_path / "scores.csv", index=False)
+    print(f"Image scores saved to {prediction_path / 'scores.csv'}")
 
     if not args.score_only:
         path_date_features = extract_features(image_paths)
+        print("Image features extracted, now grouping images")
         groups = group_by_features(path_date_features)
-
+        print("Images successfully grouped")
         culled_unflattened = [group - {extract_top_scored(group, scores)} for group in groups]
         culled_images = frozenset.union(*culled_unflattened)
         # We've restricted to groups of images, so we need to put back in the ungrouped images
@@ -222,9 +224,12 @@ def main():
 
         with open(prediction_path / "kept_images.txt", "w") as f:
             f.write("\n".join([kept_image.name for kept_image in kept_images]))
+        print(f"Kept image list saved to {prediction_path / 'kept_images.txt'}")
 
         with open(prediction_path / "culled_images.txt", "w") as f:
             f.write("\n".join([culled_image.name for culled_image in culled_images]))
+        print(f"Culled image list saved to {prediction_path / 'culled_images.txt'}")
+
 
     return 0
 
