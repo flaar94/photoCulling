@@ -14,6 +14,7 @@ import pandas as pd
 import logging
 import sys
 
+IMAGE_DIMS = 224
 
 class TypedNamespace(argparse.Namespace):
     image_path: str
@@ -40,7 +41,7 @@ def get_parser():
                         help='In order to group two photos, the number of minutes between them must be less than this '
                              'number')
     parser.add_argument("--silence", action='store_true',
-                        help='Whether to print out the status of the algorithm as it is running')
+                        help="Whether to prevent the script from printing out its updates as it's running")
     return parser
 
 
@@ -60,7 +61,7 @@ def score_paths(model: NIMA, image_paths: Iterable[Path]) -> dict[Path, float]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     test_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize((IMAGE_DIMS, IMAGE_DIMS)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
@@ -110,7 +111,7 @@ def extract_features(image_paths: Iterable[Path]) -> list[tuple[Path, datetime.d
     model.eval()
 
     test_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize((IMAGE_DIMS, IMAGE_DIMS)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
@@ -178,7 +179,7 @@ def get_evaluation_model(weight_path: Path | str) -> NIMA:
     :return: the NIMA model with loaded weights
     """
     base_model = models.vgg16(weights='VGG16_Weights.IMAGENET1K_V1')
-    model = NIMA(base_model)
+    model = NIMA(base_model, image_dims=IMAGE_DIMS)
 
     try:
         model.load_state_dict(torch.load(weight_path))
