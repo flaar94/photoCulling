@@ -14,8 +14,6 @@ import pandas as pd
 import logging
 import sys
 
-LOGGING_LEVEL = logging.INFO
-
 
 class TypedNamespace(argparse.Namespace):
     image_path: str
@@ -24,6 +22,7 @@ class TypedNamespace(argparse.Namespace):
     score_only: bool
     similarity_threshold: float
     time_threshold: int
+    silence: bool
 
 
 def get_parser():
@@ -40,6 +39,8 @@ def get_parser():
     parser.add_argument("--time_threshold", type=int, default=10,
                         help='In order to group two photos, the number of minutes between them must be less than this '
                              'number')
+    parser.add_argument("--silence", action='store_true',
+                        help='Whether to print out the status of the algorithm as it is running')
     return parser
 
 
@@ -142,6 +143,8 @@ def group_by_features(data: Iterable[tuple[Path, datetime.datetime, torch.tensor
 
     Args:
         data: triples of path, datetime, and (base) model features
+        time_threshold: how many minutes between pictures is allowed for two photos to be grouped
+        similarity_threshold: the minimum cosine similarity between photos' base-model features for them to be grouped
 
     Returns: Set of groups of images that are similar in time and features
 
@@ -180,8 +183,8 @@ def get_evaluation_model(weight_path: Path | str) -> NIMA:
     try:
         model.load_state_dict(torch.load(weight_path))
         logging.info('successfully loaded evaluation model')
-    except:
-        raise RuntimeError("Could not load state dictionary, are you sure your path is correct?")
+    except OSError:
+        raise OSError("Could not load state dictionary, are you sure your path is correct?")
 
     seed = 42
     torch.manual_seed(seed)
@@ -200,9 +203,11 @@ def extract_top_scored(group: Iterable[Path], scores: dict[Path, float]) -> Path
 
 
 def main():
-    logging.basicConfig(level=LOGGING_LEVEL, stream=sys.stdout, format="%(message)s")
     parser = get_parser()
     args = parser.parse_args(namespace=TypedNamespace())
+
+    logging_level = logging.WARNING if args.silence else logging.INFO
+    logging.basicConfig(level=logging_level, stream=sys.stdout, format="%(message)s")
     logging.info(args)
 
     image_dir = Path(args.image_path)
