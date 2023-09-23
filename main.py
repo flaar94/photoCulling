@@ -11,6 +11,10 @@ from model.model import NIMA
 from collections.abc import Iterable
 import argparse
 import pandas as pd
+import logging
+import sys
+
+LOGGING_LEVEL = logging.INFO
 
 
 class TypedNamespace(argparse.Namespace):
@@ -131,7 +135,8 @@ def extract_features(image_paths: Iterable[Path]) -> list[tuple[Path, datetime.d
     return data
 
 
-def group_by_features(data: Iterable[tuple[Path, datetime.datetime, torch.tensor]], time_threshold, similarity_threshold) -> set[frozenset[Path]]:
+def group_by_features(data: Iterable[tuple[Path, datetime.datetime, torch.tensor]], time_threshold,
+                      similarity_threshold) -> set[frozenset[Path]]:
     """
     Determine pairs of items that are similar in time and VGG features
 
@@ -174,7 +179,7 @@ def get_evaluation_model(weight_path: Path | str) -> NIMA:
 
     try:
         model.load_state_dict(torch.load(weight_path))
-        print('successfully loaded evaluation model')
+        logging.info('successfully loaded evaluation model')
     except:
         raise RuntimeError("Could not load state dictionary, are you sure your path is correct?")
 
@@ -195,9 +200,10 @@ def extract_top_scored(group: Iterable[Path], scores: dict[Path, float]) -> Path
 
 
 def main():
+    logging.basicConfig(level=LOGGING_LEVEL, stream=sys.stdout, format="%(message)s")
     parser = get_parser()
     args = parser.parse_args(namespace=TypedNamespace())
-    print(args)
+    logging.info(args)
 
     image_dir = Path(args.image_path)
     image_paths = list(itertools.chain(image_dir.glob("*.jpg"),
@@ -211,14 +217,14 @@ def main():
     if not prediction_path.exists():
         prediction_path.mkdir(parents=True)
     pd.DataFrame(scores.items(), columns=["path", "score"]).to_csv(prediction_path / "scores.csv", index=False)
-    print(f"Image scores saved to {prediction_path / 'scores.csv'}")
+    logging.info(f"Image scores saved to {prediction_path / 'scores.csv'}")
 
     if not args.score_only:
         path_date_features = extract_features(image_paths)
-        print("Image features extracted, now grouping images")
+        logging.info("Image features extracted, now grouping images")
         groups = group_by_features(path_date_features,
                                    time_threshold=args.time_threshold, similarity_threshold=args.similarity_threshold)
-        print("Images successfully grouped")
+        logging.info("Images successfully grouped")
         culled_unflattened = [group - {extract_top_scored(group, scores)} for group in groups]
         culled_images = frozenset.union(*culled_unflattened)
         # We've restricted to groups of images, so we need to put back in the ungrouped images
@@ -226,12 +232,11 @@ def main():
 
         with open(prediction_path / "kept_images.txt", "w") as f:
             f.write("\n".join([kept_image.name for kept_image in kept_images]))
-        print(f"Kept image list saved to {prediction_path / 'kept_images.txt'}")
+        logging.info(f"Kept image list saved to {prediction_path / 'kept_images.txt'}")
 
         with open(prediction_path / "culled_images.txt", "w") as f:
             f.write("\n".join([culled_image.name for culled_image in culled_images]))
-        print(f"Culled image list saved to {prediction_path / 'culled_images.txt'}")
-
+        logging.info(f"Culled image list saved to {prediction_path / 'culled_images.txt'}")
 
     return 0
 
