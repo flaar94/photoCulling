@@ -47,14 +47,13 @@ def get_parser():
 
 def score_paths(model: NIMA, image_paths: Iterable[Path]) -> dict[Path, float]:
     """
-    Takes a collection of paths, and computes the predicted aesthetic score for each one, returning the predicted best
-    image along with predicted scores for all images
+    Takes a collection of paths, and computes the predicted aesthetic score for each one
 
     Args:
         model: A model which computes quality scores for images
         image_paths: A collection of paths to images
 
-    Returns: The path to the best image, and a dictionary mapping image paths to associated scores
+    Returns: A dictionary mapping image paths to associated scores
 
     """
 
