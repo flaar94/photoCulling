@@ -29,7 +29,7 @@ class TypedNamespace(argparse.Namespace):
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--image_path', type=str, required=True, help='path to file or folder containing images')
-    parser.add_argument('--model_path', type=str, default="model_weights/filtered_v2_epoch-40.pth",
+    parser.add_argument('--model_path', type=str, default="model_weights/filtered_v4_epoch-35.pth",
                         help='path to pretrained model')
     parser.add_argument('--prediction_path', type=str, default="predictions",
                         help='output directory to store predictions')
