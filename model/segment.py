@@ -3,14 +3,8 @@ from dataclasses import dataclass
 import math
 from operator import mul
 from functools import reduce
-from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights, maskrcnn_resnet50_fpn_v2
-from pathlib import Path
-import itertools
-from PIL import Image
+from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights
 import torch
-import numpy as np
-
-import torchvision.transforms.functional as F
 
 LAPLACE_KERNEL = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=torch.float32,
                               requires_grad=False).unsqueeze(0).unsqueeze(0)
@@ -30,9 +24,6 @@ category_groups = {"person": ["person"], "animal": animals, "vehicle": vehicles,
 priorities = {"person": 2, "animal": 2, "food": 3, "vehicle": 4, "object": 5, "medium": 6, "misc": 6}
 
 WEIGHTS = MaskRCNN_ResNet50_FPN_V2_Weights.COCO_V1
-
-
-# transforms = weights.transforms()
 
 class SegmentationScores(NamedTuple):
     area_score: float
