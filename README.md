@@ -23,11 +23,14 @@ pip install -r requirements.txt
 ``
 python -m main --image_path samples
 ``
+
 This is a pure NIMA based score. To add in the instance-segmentation based scores, you can use the model_mix option, eg: 
+
 ``
 python -m main --image_path samples --model_mix uniform
 ``
-This will find all images (.jpg, .jpeg, .png) in the "samples" directory, and save 3 files to the directory
+
+Either way, it will find all images (.jpg, .jpeg, .png) in the "samples" directory, and save 3 files to the directory
 'predictions'
 - scores.csv - containing two columns: the image path and the scores for each image 
 - kept_images.txt, culled_images.txt - containing the filenames of suggested images to be kept vs. culled, one on each line
