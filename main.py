@@ -247,7 +247,9 @@ def main():
                                        image_dir.glob("*.jpeg"),
                                        image_dir.glob("*.png")))
 
-    if args.model_mix == "nima_only":
+    if args.weights is not None:
+        weights = args.weights
+    elif args.model_mix == "nima_only":
         # TODO: improve readability of weights.
         # Weight order: NIMA, area_score, centered_score, object_type_score, sharpness_score
         weights = [1, 0, 0, 0, 0]
@@ -260,7 +262,7 @@ def main():
     else:
         raise NotImplementedError(f"{args.model_mix=} not yet implemented (how did you even get here?)")
 
-
+    print(weights)
     if weights[0]:
         nima_model = get_evaluation_model(weight_path=args.model_path)
         nima_scores = nima_score_paths(nima_model, image_paths)
