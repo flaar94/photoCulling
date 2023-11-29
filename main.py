@@ -48,7 +48,7 @@ def get_parser():
                         help="Whether to prevent the script from printing out its updates as it's running")
     parser.add_argument("--model_mix", default="nima_only", choices=["nima_only", "uniform", "uniform_seg_only"],
                         help="Which models/scores to use to make predictions")
-    parser.add_argument("--weights", default=None, required=False, nargs='+', type=float,
+    parser.add_argument("--weights", default=None, required=False, nargs=5, type=float,
                         help="Explicit set of 5 space separated weights. Overrides model_mix. Eg: '0.1 1 1 1 2.5' Still"
                              " in development, so you might break something with cryptic errors if you provide an "
                              "invalid input.")
