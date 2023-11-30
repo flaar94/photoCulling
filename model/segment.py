@@ -7,7 +7,7 @@ from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights
 import torch
 
 LAPLACE_KERNEL = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=torch.float32,
-                              requires_grad=False).unsqueeze(0).unsqueeze(0)
+                              requires_grad=False).unsqueeze(0).unsqueeze(0) / 6.
 
 animals = ["cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"]
 vehicles = ["bicycle", "car", "motorcycle", "airplane", "bus", "truck", "boat"]
@@ -122,17 +122,28 @@ class MaskList(list):
                                    ])
 
     def merge(self) -> torch.Tensor:
+        """
+        Takes a list of masks, and combines them into a single tensor mask
+
+        :return: tensor mask, (note: not the Mask class, since it has no single object type)
+        """
         return 1 - reduce(mul, torch.prod(torch.stack([1 - mask.mask for mask in self]), dim=0))
 
     @staticmethod
-    def pointwise_sharpness(image: torch.Tensor):
+    def pointwise_sharpness(image: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the "sharpness" at each point, ie convolves the laplace kernel with each square of 9 pixels.
+
+        :param image: a tensor representing an image of shape (3 x width x height)
+        :return: A tensor in the shape of the original image but with 2 pixels less width and height
+        """
         with torch.no_grad():
             pointwise_sharpness = torch.conv2d(image.unsqueeze(1),
                                                weight=LAPLACE_KERNEL.to(image.device)).squeeze().sum(dim=0)
         return pointwise_sharpness
 
     @staticmethod
-    def weighted_central_root_moment(x, weight=None, p=4, quartile=0.99):
+    def weighted_central_root_moment(x, weight=None, p=4, quartile=0.995):
         if weight is None:
             weight = torch.ones_like(x)
 
@@ -146,7 +157,7 @@ class MaskList(list):
         return float((((x - weighted_mean) ** p * weight).sum() / weight.sum()) ** (1 / p))
 
     @staticmethod
-    def weighted_quartile_mean(x, weight=None, p=1, quartile=0.99):
+    def weighted_quartile_mean(x, weight=None, p=1, quartile=0.995):
         if weight is None:
             weight = torch.ones_like(x)
 
@@ -159,7 +170,7 @@ class MaskList(list):
 
         return float(weighted_mean ** (1 / p))
 
-    def area_error(self, ideal_range: tuple[float, float] = (0.5, 0.8), eps=0.01) -> float:
+    def area_error(self, ideal_range: tuple[float, float] = (0.3, 0.8), eps=0.01) -> float:
         """
         Computes how much an objects area differs from the ideal range.
 
@@ -168,7 +179,8 @@ class MaskList(list):
 
         Args:
             ideal_range: tuple of floats. Any total areas within this range will result in an error of 0.
-            eps: regularization parameter
+            eps: regularization parameter. Roughly like the fraction of the image that we consider very bad,
+                and making it even smaller doesn't increase the error by much
 
         Returns: float between 0 and 1
 
@@ -184,9 +196,16 @@ class MaskList(list):
         else:
             return 0
 
-    def center_error(self) -> float:
+    def center_error(self, ideal_object_center=(0.5, 0.6), error_buffer=0.1) -> float:
         """
-        Computes how much the center of objects differs from the center. We use L1 distance based on the assumption that diagonal distance is particularly bad
+        Computes how much the center of objects differs from the center. We use L1 distance based on the assumption that
+        diagonal distance is particularly bad. I've set the ideal center slightly to the right since the internet
+        tells me right-side composition is more common.
+
+        Args:
+            ideal_object_center: the ideal center of the object
+            error_buffer: how far from the ideal_center the object is allowed to be without taking a penalty
+                Note: the buffer zone is a diamond, not a flat square
 
         Returns: float between 0 and 1
 
@@ -195,7 +214,8 @@ class MaskList(list):
             return 1.
         weighted_center = [sum([mask.center[i] * mask.confidence * mask.area for mask in self]) / sum(
             [mask.confidence * mask.area for mask in self]) for i in range(2)]
-        return abs(0.5 - weighted_center[0]) + abs(0.5 - weighted_center[1])
+        return max(abs(ideal_object_center[0] - weighted_center[0]) - error_buffer, 0) + \
+                max(abs(ideal_object_center[1] - weighted_center[1]) - error_buffer, 0)
 
     def priority_error(self):
         if not self:

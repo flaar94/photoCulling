@@ -1,3 +1,5 @@
+import time
+
 from PIL import Image, ExifTags
 from pathlib import Path
 import itertools
@@ -16,8 +18,10 @@ import pandas as pd
 import logging
 import sys
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights, maskrcnn_resnet50_fpn_v2
+from torch.utils.data import Dataset, DataLoader
 
 IMAGE_DIMS = 224
+
 
 class TypedNamespace(argparse.Namespace):
     image_path: str
@@ -55,6 +59,22 @@ def get_parser():
     return parser
 
 
+class ImageDataset(Dataset):
+    def __init__(self, image_paths: Iterable[Path], transform=None):
+        self.image_paths = list(image_paths)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, item):
+        image_path = self.image_paths[item]
+        image = Image.open(image_path).convert('RGB')
+        if self.transform is not None:
+            image = self.transform(image)
+        return image
+
+
 def nima_score_paths(nima_model: NIMA, image_paths: Iterable[Path]) -> dict[Path, float]:
     """
     Takes a collection of paths, and computes the predicted aesthetic score for each one
@@ -75,28 +95,23 @@ def nima_score_paths(nima_model: NIMA, image_paths: Iterable[Path]) -> dict[Path
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
     ])
-    scores = []
-    for i, img in enumerate(image_paths):
-        mean, std = 0.0, 0.0
-        im = Image.open(img)
-        im = im.convert('RGB')
-        imt = test_transform(im)
-        imt = imt.unsqueeze(dim=0)
-        imt = imt.to(device)
+    image_dataset = ImageDataset(image_paths, transform=test_transform)
+    image_dataloader = DataLoader(image_dataset,
+                                  batch_size=10,
+                                  shuffle=False)
+    one_to_ten = torch.arange(10, device=device, requires_grad=False, dtype=torch.float)
+
+    means_batches = []
+    for images_batch in image_dataloader:
         with torch.no_grad(), torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
-            out = nima_model(imt)
+            images_batch = images_batch.to(device)
+            outs = nima_model(images_batch)
+            means_batch = outs @ one_to_ten
 
-        out = out.view(10, 1)
-        for j, e in enumerate(out, 1):
-            mean += j * e
-        for k, e in enumerate(out, 1):
-            std += e * (k - mean) ** 2
-        std = std ** 0.5
+            means_batches.append(means_batch.cpu())
+    flattened_means = (mean for means_batch in means_batches for mean in means_batch)
 
-        mean, std = float(mean), float(std)
-        scores.append((img, mean))
-
-    return dict(scores)
+    return {image_path: float(mean) for image_path, mean in zip(image_paths, flattened_means)}
 
 
 def extract_features(image_paths: Iterable[Path]) -> list[tuple[Path, datetime.datetime, torch.tensor]]:
@@ -212,6 +227,7 @@ def get_evaluation_model(weight_path: Path | str) -> NIMA:
 def extract_top_scored(group: Iterable[Path], scores: dict[Path, float]) -> Path:
     return max(group, key=lambda path: scores[path])
 
+
 def segmentation_score_paths(image_paths: Iterable[Path]) -> dict[Path, SegmentationScores]:
     segmentation_weights = MaskRCNN_ResNet50_FPN_V2_Weights.COCO_V1
     segmentation_model = maskrcnn_resnet50_fpn_v2(weights=segmentation_weights)
@@ -234,6 +250,7 @@ def segmentation_score_paths(image_paths: Iterable[Path]) -> dict[Path, Segmenta
 
     return scores
 
+
 def main():
     parser = get_parser()
     args = parser.parse_args(namespace=TypedNamespace())
@@ -254,8 +271,8 @@ def main():
         # Weight order: NIMA, area_score, centered_score, object_type_score, sharpness_score
         weights = [1, 0, 0, 0, 0]
     elif args.model_mix == "uniform":
-        # Note, nima evaluates from 1 to 10 instead of (sometimes roughly) 0 to 1, so we scale it down by a factor of 10
-        weights = [1 / 50, 1 / 5, 1 / 5, 1 / 5, 1 / 5]
+        # Note, nima is usually between 4 and 6 instead of (sometimes roughly) 0 to 1, so we scale it down by a factor of 2
+        weights = [1 / 10, 1 / 5, 1 / 5, 1 / 5, 1 / 5]
     elif args.model_mix == "uniform_seg_only":
         # Note, nima evaluates from 1 to 10, so we scale it down
         weights = [0, 1 / 4, 1 / 4, 1 / 4, 1 / 4]
@@ -280,13 +297,13 @@ def main():
     # for now
     scores = {
         image_path:
-        nima_scores[image_path] * weights[0] +
-        segmentation_scores[image_path].area_score * weights[1] +
-        segmentation_scores[image_path].centered_score * weights[2] +
-        segmentation_scores[image_path].object_type_score * weights[3] +
-        segmentation_scores[image_path].sharpness_score * weights[4]
-     for image_path in image_paths
-     }
+            nima_scores[image_path] * weights[0] +
+            segmentation_scores[image_path].area_score * weights[1] +
+            segmentation_scores[image_path].centered_score * weights[2] +
+            segmentation_scores[image_path].object_type_score * weights[3] +
+            segmentation_scores[image_path].sharpness_score * weights[4]
+        for image_path in image_paths
+    }
 
     prediction_path = Path(args.prediction_path)
     if not prediction_path.exists():
