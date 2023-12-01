@@ -1,5 +1,3 @@
-import time
-
 from PIL import Image, ExifTags
 from pathlib import Path
 import itertools
@@ -20,6 +18,14 @@ import sys
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights, maskrcnn_resnet50_fpn_v2
 from torch.utils.data import Dataset, DataLoader
 
+# This is the maximum number of pictures that will be fed into the VGG-based models at once. Should be small enough to
+# not use 8GB of VRAM, but you can make it smaller if running into memory problems, or increase it if you want to try
+# speeding it up.
+# Note: doesn't apply to instance segmentation model which doesn't rescale images, so can potentially use lots of memory
+BATCH_SIZE = 10
+
+# The size of images that VGG16/NIMA expects. Images will be resized to this for those purposes
+# Note: doesn't apply to the instance segmentation model
 IMAGE_DIMS = 224
 
 
@@ -50,7 +56,8 @@ def get_parser():
                              'number')
     parser.add_argument("--silence", action='store_true',
                         help="Whether to prevent the script from printing out its updates as it's running")
-    parser.add_argument("--model_mix", default="nima_only", choices=["nima_only", "uniform", "uniform_seg_only"],
+    parser.add_argument("--model_mix", default="nima_only",
+                        choices=["nima", "uniform", "uniform_seg", "sharpness"],
                         help="Which models/scores to use to make predictions")
     parser.add_argument("--weights", default=None, required=False, nargs=5, type=float,
                         help="Explicit set of 5 space separated weights. Overrides model_mix. Eg: '0.1 1 1 1 2.5' Still"
@@ -74,6 +81,19 @@ class ImageDataset(Dataset):
             image = self.transform(image)
         return image
 
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+
+def extract_top_scored(group: Iterable[Path], scores: dict[Path, float]) -> Path:
+    """Grabs path whose corresponding image got the highest score in the group"""
+    return max(group, key=lambda path: scores[path])
+
+
+def flatten_batches(batches: Iterable[torch.Tensor]):
+    return (item for batch in batches for item in batch)
+
 
 def nima_score_paths(nima_model: NIMA, image_paths: Iterable[Path]) -> dict[Path, float]:
     """
@@ -96,9 +116,7 @@ def nima_score_paths(nima_model: NIMA, image_paths: Iterable[Path]) -> dict[Path
                              std=[0.229, 0.224, 0.225])
     ])
     image_dataset = ImageDataset(image_paths, transform=test_transform)
-    image_dataloader = DataLoader(image_dataset,
-                                  batch_size=10,
-                                  shuffle=False)
+    image_dataloader = DataLoader(image_dataset, batch_size=BATCH_SIZE, shuffle=False)
     one_to_ten = torch.arange(10, device=device, requires_grad=False, dtype=torch.float)
 
     means_batches = []
@@ -109,7 +127,7 @@ def nima_score_paths(nima_model: NIMA, image_paths: Iterable[Path]) -> dict[Path
             means_batch = outs @ one_to_ten
 
             means_batches.append(means_batch.cpu())
-    flattened_means = (mean for means_batch in means_batches for mean in means_batch)
+    flattened_means = flatten_batches(means_batches)
 
     return {image_path: float(mean) for image_path, mean in zip(image_paths, flattened_means)}
 
@@ -141,25 +159,30 @@ def extract_features(image_paths: Iterable[Path]) -> list[tuple[Path, datetime.d
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
     ])
+    image_dataset = ImageDataset(image_paths, transform=test_transform)
+    image_dataloader = DataLoader(image_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    # Grab metadata and compute VGG features
-    data = []
+    # First compute VGG features
+    features_batches = []
+    for images_batch in image_dataloader:
+        with torch.no_grad(), torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+            images_batch = images_batch.to(device)
+            features_batches.append(model.features(images_batch))
+    unbatched_features = (features for features_batch in features_batches for features in features_batch)
+
+    # Grab the time a picture was taken from the metadata (to help with grouping photos)
+    photo_capture_times = []
     for image_path in image_paths:
-        img = Image.open(image_path)
-        exif = {ExifTags.TAGS[k]: v for k, v in img.getexif().items() if k in ExifTags.TAGS}
-        picture_time = datetime.datetime.strptime(exif["DateTime"],
-                                                  "%Y:%m:%d %H:%M:%S") if "DateTime" in exif else datetime.datetime(1,
-                                                                                                                    1,
-                                                                                                                    1)
-        im = Image.open(image_path)
-        im = im.convert('RGB')
-        imt = test_transform(im)
-        imt = imt.unsqueeze(dim=0)
-        imt = imt.to(device)
-        features = model.features(imt)
+        image = Image.open(image_path)
+        # convert metadata into a human readable dictionary
+        image_metadata = {ExifTags.TAGS[k]: v for k, v in image.getexif().items() if k in ExifTags.TAGS}
+        photo_capture_time = datetime.datetime.strptime(image_metadata["DateTime"],
+                                                        "%Y:%m:%d %H:%M:%S") if "DateTime" in image_metadata \
+            else datetime.datetime(1, 1, 1)
+        photo_capture_times.append(photo_capture_time)
+    combined_features = list(zip(image_paths, photo_capture_times, unbatched_features))
 
-        data.append((image_path, picture_time, features))
-    return data
+    return combined_features
 
 
 def group_by_features(data: Iterable[tuple[Path, datetime.datetime, torch.tensor]], time_threshold,
@@ -216,16 +239,10 @@ def get_evaluation_model(weight_path: Path | str) -> NIMA:
     torch.manual_seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     model = model.to(device)
-
     model.eval()
 
     return model
-
-
-def extract_top_scored(group: Iterable[Path], scores: dict[Path, float]) -> Path:
-    return max(group, key=lambda path: scores[path])
 
 
 def segmentation_score_paths(image_paths: Iterable[Path]) -> dict[Path, SegmentationScores]:
@@ -234,20 +251,16 @@ def segmentation_score_paths(image_paths: Iterable[Path]) -> dict[Path, Segmenta
     segmentation_transforms = segmentation_weights.transforms()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     segmentation_model = segmentation_model.eval().to(device)
-    scores = {}
-    for i, image_path in enumerate(image_paths):
-        print(image_path)
-        # if "atom" not in str(image_path):
-        #     continue
-        im = Image.open(image_path)
-        im = im.convert('RGB')
-        imt = segmentation_transforms(im).to(device)
-        with torch.no_grad():
-            output = segmentation_model(imt.unsqueeze(0))
-        masks = MaskList.from_model_output(output[0]).select_top_masks()
-        # print([mask for mask in masks])
-        scores[image_path] = masks.scores(imt)
 
+    image_dataset = ImageDataset(image_paths, transform=segmentation_transforms)
+
+    scores = {}
+    for image_path, image_tensor in zip(image_paths, image_dataset):
+        image_tensor = image_tensor.to(device=device)
+        with torch.no_grad():
+            output = segmentation_model(image_tensor.unsqueeze(0))
+        mask_list = MaskList.from_model_output(output[0]).select_top_masks()
+        scores[image_path] = mask_list.scores(image_tensor)
     return scores
 
 
@@ -264,22 +277,21 @@ def main():
                                        image_dir.glob("*.jpeg"),
                                        image_dir.glob("*.png")))
 
+    weight_options = {
+        # Weight order: NIMA, area_score, centered_score, object_type_score, sharpness_score
+        "nima": [1, 0, 0, 0, 0],
+        # Note, nima is usually between 4 and 6 instead of (sometimes roughly) 0 to 1, so we scale it down by a factor of 2
+        "uniform": [1 / 10, 1 / 5, 1 / 5, 1 / 5, 1 / 5],
+        "uniform_seg": [0, 1 / 4, 1 / 4, 1 / 4, 1 / 4],
+        "sharpness": [0, 0, 0, 0, 1]
+    }
+
     if args.weights is not None:
         weights = args.weights
-    elif args.model_mix == "nima_only":
-        # TODO: improve readability of weights.
-        # Weight order: NIMA, area_score, centered_score, object_type_score, sharpness_score
-        weights = [1, 0, 0, 0, 0]
-    elif args.model_mix == "uniform":
-        # Note, nima is usually between 4 and 6 instead of (sometimes roughly) 0 to 1, so we scale it down by a factor of 2
-        weights = [1 / 10, 1 / 5, 1 / 5, 1 / 5, 1 / 5]
-    elif args.model_mix == "uniform_seg_only":
-        # Note, nima evaluates from 1 to 10, so we scale it down
-        weights = [0, 1 / 4, 1 / 4, 1 / 4, 1 / 4]
     else:
-        raise NotImplementedError(f"{args.model_mix=} not yet implemented (how did you even get here?)")
+        weights = weight_options[args.model_mix]
 
-    print(weights)
+    logging.info(f"Using {weights=}")
     if weights[0]:
         nima_model = get_evaluation_model(weight_path=args.model_path)
         nima_scores = nima_score_paths(nima_model, image_paths)

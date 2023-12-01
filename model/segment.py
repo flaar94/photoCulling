@@ -5,9 +5,13 @@ from operator import mul
 from functools import reduce
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights
 import torch
+import warnings
+import numpy as np
 
 LAPLACE_KERNEL = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=torch.float32,
                               requires_grad=False).unsqueeze(0).unsqueeze(0) / 6.
+
+MAX_QUANTILE_TENSOR_SIZE = 2 ** 24
 
 animals = ["cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"]
 vehicles = ["bicycle", "car", "motorcycle", "airplane", "bus", "truck", "boat"]
@@ -25,11 +29,18 @@ priorities = {"person": 2, "animal": 2, "food": 3, "vehicle": 4, "object": 5, "m
 
 WEIGHTS = MaskRCNN_ResNet50_FPN_V2_Weights.COCO_V1
 
+
 class SegmentationScores(NamedTuple):
     area_score: float
     centered_score: float
     object_type_score: float
     sharpness_score: float
+
+
+def tensor_choice(tens: torch.Tensor, size: int):
+    """Randomly selects 'size' entries from a torch tensor. Uses numpy due to size constraints for torch."""
+    idx = np.random.default_rng().choice(tens.view(-1).shape[0], size, replace=False)
+    return tens[idx]
 
 
 @dataclass
@@ -88,23 +99,27 @@ class MaskList(list):
     def select_top_masks(self, peripheral_threshold: float = 0.2, area_multiplier: float = 4,
                          priority_adjustment: float = 2) -> Self:
         """
-        Some heuristics for determining which objects in the picture are what people are actually trying to display
+        Filters the mask list so it (hopefully) only contains important objects, using heuristics for determining which
+        objects in the picture are what people are actually trying to display.
 
         Args:
-            peripheral_threshold: how close to each side the object's center is allowed to be as a fraction of the image size (0, 1)
-            area_multiplier: If an object of priority one less than the max exists, it is ignored unless its area is area_multiplier times as large as the higher priority objects.
+            peripheral_threshold: how close to each side the object's center is allowed to be as a fraction of the image
+                size (0, 1)
+            area_multiplier: If an object of priority one less than the max exists, it is ignored unless its area is
+                area_multiplier times as large as the higher priority objects.
                 Also used to divide the largest area to determine the lower bound on the area of masks we will keep
-            priority_adjustment: Used to adjust the lower bound on the area of masks we keep. In particular, masks of higher priority will be included if priority_adjustment * (their area)
-                is larger than the unadjusted lower bound
+            priority_adjustment: Used to adjust the lower bound on the area of masks we keep. In particular, masks of
+                higher priority will be included if priority_adjustment * (their area) is larger than the unadjusted
+                lower bound
 
         Returns:
 
         """
-        if not self:
-            return self.__class__()
         # Highly peripheral objects are unlikely to be the goal even if they are high priority objects
         non_peripheral_masks = [mask for mask in self if all(
             peripheral_threshold <= position <= 1 - peripheral_threshold for position in mask.center)]
+        if not non_peripheral_masks:
+            return self.__class__()
         # If an object is very small, we allow a single point of wiggle room on priority. We don't want too much though, since things like tables or whatever are often big but almost never relevant
         highest_priority = min(mask.priority for mask in non_peripheral_masks)
         highest_priority_largest_area = max(
@@ -143,30 +158,37 @@ class MaskList(list):
         return pointwise_sharpness
 
     @staticmethod
-    def weighted_central_root_moment(x, weight=None, p=4, quartile=0.995):
+    def weighted_central_root_moment(x, weight=None, p=4, quantile=0.995):
         if weight is None:
             weight = torch.ones_like(x)
 
         weighted_mean = (x * weight).sum() / weight.sum()
 
-        if quartile:
-            # If quartile > 0 we only consider the pixels greater than the quartile, hopefully corresponding to transition areas/edges
-            quartile_value = torch.quantile(x[weight >= 0.5].view(-1), q=quartile)
-            x, weight = x[x >= quartile_value], weight[x >= quartile_value]
+        if quantile:
+            # If quantile > 0 we only consider the pixels greater than the quantile, hopefully corresponding to transition areas/edges
+            quantile_value = torch.quantile(x[weight >= 0.5].view(-1), q=quantile)
+            x, weight = x[x >= quantile_value], weight[x >= quantile_value]
 
         return float((((x - weighted_mean) ** p * weight).sum() / weight.sum()) ** (1 / p))
 
     @staticmethod
-    def weighted_quartile_mean(x, weight=None, p=1, quartile=0.995):
+    def weighted_quantile_mean(x, weight=None, p=1, quantile=0.995):
         if weight is None:
             weight = torch.ones_like(x)
 
-        if quartile:
-            # If quartile > 0 we only consider the pixels greater than the quartile, hopefully corresponding to transition areas/edges
-            quartile_value = torch.quantile(x[weight >= 0.5].view(-1), q=quartile)
-            x, weight = x[x >= quartile_value], weight[x >= quartile_value]
+        if quantile:
+            # If quantile > 0 we only consider the pixels greater than the quantile, hopefully corresponding to transition areas/edges
+            x_flat = x[weight >= 0.5].view(-1)
+            if x_flat.shape[0] > MAX_QUANTILE_TENSOR_SIZE:
+                warnings.warn("Image is too big for torch.quantile (> 2^24 ~=17 million pixels). Taking "
+                              "a sample of points to check sharpness instead of entire image.",
+                              RuntimeWarning,
+                              stacklevel=2)
+                x_flat = tensor_choice(x_flat, MAX_QUANTILE_TENSOR_SIZE)
+            quantile_value = torch.quantile(x_flat, q=quantile)
+            x, weight = x[x >= quantile_value], weight[x >= quantile_value]
 
-        weighted_mean = (x ** p * weight).sum() / weight.sum()
+        weighted_mean = (weight * x ** p).sum() / weight.sum()
 
         return float(weighted_mean ** (1 / p))
 
@@ -215,7 +237,7 @@ class MaskList(list):
         weighted_center = [sum([mask.center[i] * mask.confidence * mask.area for mask in self]) / sum(
             [mask.confidence * mask.area for mask in self]) for i in range(2)]
         return max(abs(ideal_object_center[0] - weighted_center[0]) - error_buffer, 0) + \
-                max(abs(ideal_object_center[1] - weighted_center[1]) - error_buffer, 0)
+            max(abs(ideal_object_center[1] - weighted_center[1]) - error_buffer, 0)
 
     def priority_error(self):
         if not self:
@@ -223,7 +245,7 @@ class MaskList(list):
         return sigmoid(sum([mask.priority * mask.confidence * mask.area for mask in self]) / sum(
             [mask.confidence * mask.area for mask in self])) - 0.5
 
-    def object_sharpness(self, image: torch.Tensor, method="quartile_mean", p=4, quartile=0.995):
+    def object_sharpness(self, image: torch.Tensor, method="quantile_mean", p=4, quantile=0.995):
         truncated_sharpness = self.pointwise_sharpness(image)
         # Ignore the boundary pixels which are affected by padding
         if self:
@@ -233,9 +255,9 @@ class MaskList(list):
             truncated_mask = None
 
         if method == "central_moment":
-            return self.weighted_central_root_moment(truncated_sharpness, truncated_mask, p=p, quartile=quartile)
-        if method == "quartile_mean":
-            return self.weighted_quartile_mean(truncated_sharpness, truncated_mask, p=p, quartile=quartile)
+            return self.weighted_central_root_moment(truncated_sharpness, truncated_mask, p=p, quantile=quantile)
+        if method == "quantile_mean":
+            return self.weighted_quantile_mean(truncated_sharpness, truncated_mask, p=p, quantile=quantile)
         else:
             raise NotImplementedError(f"{method=} has not been implemented, please use one of ['central_moment']")
 
