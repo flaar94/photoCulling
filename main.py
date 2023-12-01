@@ -60,9 +60,9 @@ def get_parser():
                         choices=["nima", "uniform", "uniform_seg", "sharpness"],
                         help="Which models/scores to use to make predictions")
     parser.add_argument("--weights", default=None, required=False, nargs=5, type=float,
-                        help="Explicit set of 5 space separated weights. Overrides model_mix. Eg: '0.1 1 1 1 2.5' Still"
-                             " in development, so you might break something with cryptic errors if you provide an "
-                             "invalid input.")
+                        help="Explicit set of 5 space separated weights. Overrides model_mix. Eg: '0.1 1 1 1 2.5'. Order"
+                             "of weights NIMA, area_score, centered_score, object_type_score, sharpness_score. Still "
+                             "in development.")
     return parser
 
 
