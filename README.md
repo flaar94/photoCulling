@@ -42,9 +42,9 @@ python -m main --image_path samples --weights 0 1 2.7 3.14 0.01
 
 The order of weights is 
 1. NIMA - direct model scoring, trained on human ratings of photos
-2. area_score - how close the primary objects are to taking up an area in the chosen range 
-3. centered_score - how close center of the collection of primary objects is to the chosen center 
-4. object_type_score - type of object in the image. Currently hard coded as: person=animal>food>vehicle>object>background/background-like-objects like tables, 
+2. area_score - how close the primary objects are to taking up an area in the chosen range (Temporarily hard coded as 30% to 80% of the image)
+3. centered_score - how close center of the collection of primary objects is to the chosen center (Temporarily hard coded as slightly right of center (10% of image width))
+4. object_type_score - priority of the type of object in the image. (Temporarily hard coded as: person=animal>food>vehicle>object>background/background-like-objects like tables) 
 5. sharpness_score - sharpness of primary objects in the image, defaulting to overall image sharpness if no suitable object is found
 
 Either way, it will find all images (.jpg, .jpeg, .png) in the "samples" directory, and save 3 files to the directory
