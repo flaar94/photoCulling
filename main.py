@@ -1,14 +1,17 @@
+import time
+
 from PIL import Image, ExifTags
 from pathlib import Path
 import itertools
 import datetime
 import torch
+import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.nn import functional as F
 import copy
-from model.model import NIMA
-from model.segment import MaskList, SegmentationScores
+from nima.model import NIMAMean
+from segment import MaskList, SegmentationScores
 from collections.abc import Iterable
 from collections import defaultdict
 import argparse
@@ -17,6 +20,7 @@ import logging
 import sys
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights, maskrcnn_resnet50_fpn_v2
 from torch.utils.data import Dataset, DataLoader
+from typing import Callable
 
 # This is the maximum number of pictures that will be fed into the VGG-based models at once. Should be small enough to
 # not use 8GB of VRAM, but you can make it smaller if running into memory problems, or increase it if you want to try
@@ -27,6 +31,7 @@ BATCH_SIZE = 10
 # The size of images that VGG16/NIMA expects. Images will be resized to this for those purposes
 # Note: doesn't apply to the instance segmentation model
 IMAGE_DIMS = 224
+
 
 
 class TypedNamespace(argparse.Namespace):
@@ -56,7 +61,7 @@ def get_parser():
                              'number')
     parser.add_argument("--silence", action='store_true',
                         help="Whether to prevent the script from printing out its updates as it's running")
-    parser.add_argument("--model_mix", default="nima_only",
+    parser.add_argument("--model_mix", default="nima",
                         choices=["nima", "uniform", "uniform_seg", "sharpness"],
                         help="Which models/scores to use to make predictions")
     parser.add_argument("--weights", default=None, required=False, nargs=5, type=float,
@@ -95,83 +100,27 @@ def flatten_batches(batches: Iterable[torch.Tensor]):
     return (item for batch in batches for item in batch)
 
 
-def nima_score_paths(nima_model: NIMA, image_paths: Iterable[Path]) -> dict[Path, float]:
-    """
-    Takes a collection of paths, and computes the predicted aesthetic score for each one
+def apply_model_to_paths(model: nn.Module,
+                         image_paths: Iterable[Path],
+                         transform: Callable = None) -> dict[Path, torch.Tensor]:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    Args:
-        nima_model: A model which computes quality scores for images
-        image_paths: A collection of paths to images
-
-    Returns: A dictionary mapping image paths to associated scores
-
-    """
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    test_transform = transforms.Compose([
-        transforms.Resize((IMAGE_DIMS, IMAGE_DIMS)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-    image_dataset = ImageDataset(image_paths, transform=test_transform)
-    image_dataloader = DataLoader(image_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    one_to_ten = torch.arange(10, device=device, requires_grad=False, dtype=torch.float)
-
-    means_batches = []
-    for images_batch in image_dataloader:
-        with torch.no_grad(), torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
-            images_batch = images_batch.to(device)
-            outs = nima_model(images_batch)
-            means_batch = outs @ one_to_ten
-
-            means_batches.append(means_batch.cpu())
-    flattened_means = flatten_batches(means_batches)
-
-    return {image_path: float(mean) for image_path, mean in zip(image_paths, flattened_means)}
-
-
-def extract_features(image_paths: Iterable[Path]) -> list[tuple[Path, datetime.datetime, torch.tensor]]:
-    """
-    Takes paths, and extracts the time it was taken via metadata and also computes the features using the base model
-
-    Args:
-        image_paths: the paths to the desired images to look at
-
-    Returns: A list of triples of the (original) paths, datetime taken, and base model features
-
-    """
-    feature_model = models.vgg16(weights='VGG16_Weights.IMAGENET1K_V1')
-
-    seed = 42
-    torch.manual_seed(seed)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = feature_model.to(device)
-
-    model.eval()
-
-    test_transform = transforms.Compose([
-        transforms.Resize((IMAGE_DIMS, IMAGE_DIMS)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-    image_dataset = ImageDataset(image_paths, transform=test_transform)
+    image_dataset = ImageDataset(image_paths, transform=transform)
     image_dataloader = DataLoader(image_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    # First compute VGG features
-    features_batches = []
+    batches = []
     for images_batch in image_dataloader:
-        with torch.no_grad(), torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+        with torch.no_grad(), torch.autocast(device_type=device):
             images_batch = images_batch.to(device)
-            features_batches.append(model.features(images_batch))
-    unbatched_features = (features for features_batch in features_batches for features in features_batch)
+            batch = model(images_batch)
+            batches.append(batch)
+    flattened_tensors = list(flatten_batches(batches))
 
-    # Grab the time a picture was taken from the metadata (to help with grouping photos)
-    photo_capture_times = []
+    return {image_path: model_output for image_path, model_output in zip(image_paths, flattened_tensors)}
+
+
+def extract_time_metadata(image_paths) -> dict[Path, datetime.datetime]:
+    photo_capture_times = {}
     for image_path in image_paths:
         image = Image.open(image_path)
         # convert metadata into a human readable dictionary
@@ -179,19 +128,21 @@ def extract_features(image_paths: Iterable[Path]) -> list[tuple[Path, datetime.d
         photo_capture_time = datetime.datetime.strptime(image_metadata["DateTime"],
                                                         "%Y:%m:%d %H:%M:%S") if "DateTime" in image_metadata \
             else datetime.datetime(1, 1, 1)
-        photo_capture_times.append(photo_capture_time)
-    combined_features = list(zip(image_paths, photo_capture_times, unbatched_features))
-
-    return combined_features
+        photo_capture_times[image_path] = photo_capture_time
+    return photo_capture_times
 
 
-def group_by_features(data: Iterable[tuple[Path, datetime.datetime, torch.tensor]], time_threshold,
-                      similarity_threshold) -> set[frozenset[Path]]:
+def group_by_features(image_features: dict[Path, torch.Tensor],
+                      time_metadata: dict[Path, datetime.datetime],
+                      similarity_threshold,
+                      time_threshold,
+                      ) -> set[frozenset[Path]]:
     """
     Determine pairs of items that are similar in time and VGG features
 
     Args:
-        data: triples of path, datetime, and (base) model features
+        image_features: dictionary mapping image paths to computed VGG-16 feature vectors
+        time_metadata: dictionary mapping image paths to extracted image collection times
         time_threshold: how many minutes between pictures is allowed for two photos to be grouped
         similarity_threshold: the minimum cosine similarity between photos' base-model features for them to be grouped
 
@@ -200,7 +151,10 @@ def group_by_features(data: Iterable[tuple[Path, datetime.datetime, torch.tensor
     """
     similar_images = []
     all_connected_images = set()
-    for (image_path1, datetime1, features1), (image_path2, datetime2, features2) in itertools.combinations(data, 2):
+    for image_path1, image_path2 in itertools.combinations(image_features.keys(), 2):
+        features1, features2 = image_features[image_path1], image_features[image_path2]
+        datetime1, datetime2 = time_metadata[image_path1], time_metadata[image_path2]
+
         if abs(datetime1 - datetime2) <= datetime.timedelta(minutes=time_threshold) and F.cosine_similarity(
                 features1.view(1, -1), features2.view(1, -1)).cpu().data >= similarity_threshold:
             similar_images.append([image_path1, image_path2])
@@ -219,30 +173,44 @@ def group_by_features(data: Iterable[tuple[Path, datetime.datetime, torch.tensor
     return groups
 
 
-def get_evaluation_model(weight_path: Path | str) -> NIMA:
+def get_evaluation_model(weight_path: Path | str) -> tuple[NIMAMean, callable]:
     """
     Sets up the model used to evaluate photo quality
 
     :param weight_path: path to the filed containing the weights for the pretrained model
     :return: the NIMA model with loaded weights
     """
-    base_model = models.vgg16(weights='VGG16_Weights.IMAGENET1K_V1')
-    model = NIMA(base_model, image_dims=IMAGE_DIMS)
-
+    # These weights will get overwritten, but it's actually faster to load them, I guess due to weight initialization
+    weights = models.VGG16_Weights.IMAGENET1K_V1
+    base_model = models.vgg16(weights=weights)
+    model = NIMAMean(base_model, image_dims=IMAGE_DIMS)
     try:
         model.load_state_dict(torch.load(weight_path))
         logging.info('successfully loaded evaluation model')
     except OSError:
         raise OSError("Could not load state dictionary, are you sure your path is correct?")
 
-    seed = 42
-    torch.manual_seed(seed)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
     model.eval()
 
-    return model
+    nima_transform = transforms.Compose([
+        transforms.Resize((IMAGE_DIMS, IMAGE_DIMS)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+
+    return model, nima_transform
+
+
+def get_feature_model() -> tuple[models.VGG, callable]:
+    weights = models.VGG16_Weights.IMAGENET1K_V1
+    feature_model = models.vgg16(weights=weights)
+    feature_model.to("cuda" if torch.cuda.is_available() else "cpu")
+    feature_model.eval()
+
+    return feature_model.features, weights.transforms()
 
 
 def segmentation_score_paths(image_paths: Iterable[Path]) -> dict[Path, SegmentationScores]:
@@ -272,6 +240,9 @@ def main():
     logging.basicConfig(level=logging_level, stream=sys.stdout, format="%(message)s")
     logging.info(args)
 
+    seed = 42
+    torch.manual_seed(seed)
+
     image_dir = Path(args.image_path)
     image_paths = list(itertools.chain(image_dir.glob("*.jpg"),
                                        image_dir.glob("*.jpeg"),
@@ -293,8 +264,8 @@ def main():
 
     logging.info(f"Using {weights=}")
     if weights[0]:
-        nima_model = get_evaluation_model(weight_path=args.model_path)
-        nima_scores = nima_score_paths(nima_model, image_paths)
+        nima_model, nima_transforms = get_evaluation_model(weight_path=args.model_path)
+        nima_scores = apply_model_to_paths(nima_model, image_paths, transform=nima_transforms)
     else:
         # if no relevant weights, we just grab a dictionary that returns zeros
         nima_scores = defaultdict(int)
@@ -309,7 +280,7 @@ def main():
     # for now
     scores = {
         image_path:
-            nima_scores[image_path] * weights[0] +
+            float(nima_scores[image_path]) * weights[0] +
             segmentation_scores[image_path].area_score * weights[1] +
             segmentation_scores[image_path].centered_score * weights[2] +
             segmentation_scores[image_path].object_type_score * weights[3] +
@@ -324,10 +295,16 @@ def main():
     logging.info(f"Image scores saved to {prediction_path / 'scores.csv'}")
 
     if not args.score_only:
-        path_date_features = extract_features(image_paths)
+        feature_model, feature_transforms = get_feature_model()
+        image_features = apply_model_to_paths(feature_model, image_paths, transform=feature_transforms)
+
+        time_metadata = extract_time_metadata(image_paths)
         logging.info("Image features extracted, now grouping images")
-        groups = group_by_features(path_date_features,
-                                   time_threshold=args.time_threshold, similarity_threshold=args.similarity_threshold)
+        groups = group_by_features(image_features,
+                                   time_metadata,
+                                   similarity_threshold=args.similarity_threshold,
+                                   time_threshold=args.time_threshold,
+                                   )
         logging.info("Images successfully grouped")
         culled_unflattened = [group - {extract_top_scored(group, scores)} for group in groups]
         culled_images = frozenset.union(*culled_unflattened)

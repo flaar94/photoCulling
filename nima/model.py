@@ -33,3 +33,15 @@ class NIMA(nn.Module):
         out = out.view(out.shape[0], -1)
         out = self.classifier(out)
         return out
+
+
+class NIMAMean(NIMA):
+    """
+    Thin wrapper for NIMA outputting a numeric mean instead of a distribution, to smooth away some of NIMA's
+    quirkiness to make it easier to slot in other models.
+    """
+
+    def forward(self, x):
+        one_to_ten = torch.arange(1, 10 + 1, device=x.device, requires_grad=False, dtype=torch.float)
+        mean_dist = super().forward(x)
+        return mean_dist @ one_to_ten
