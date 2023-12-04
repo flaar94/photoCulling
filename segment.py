@@ -23,14 +23,16 @@ objects = ["traffic light", "stop sign", "parking meter", "fire hydrant", "wine 
            "surfboard", "tennis racket", "backpack", "umbrella", "handbag", "tie", "suitcase"]
 mediums = ["bed", "dining table", "sink", "refrigerator", "chair", "bench"]
 misc = ["__background__", "N/A"]
-category_groups = {"person": ["person"], "animal": animals, "vehicle": vehicles, "food": food, "object": objects,
+CATEGORY_GROUPS = {"person": ["person"], "animal": animals, "vehicle": vehicles, "food": food, "object": objects,
                    "medium": mediums, "misc": misc}
-priorities = {"person": 2, "animal": 2, "food": 3, "vehicle": 4, "object": 5, "medium": 6, "misc": 6}
+
+PRIORITIES = {"person": 2, "animal": 2, "food": 3, "vehicle": 4, "object": 5, "medium": 6, "misc": 6}
 
 WEIGHTS = MaskRCNN_ResNet50_FPN_V2_Weights.COCO_V1
 
 
 class SegmentationScores(NamedTuple):
+    """Namedtuple to make the output of MaskList.scores() more readable"""
     area_score: float
     centered_score: float
     object_type_score: float
@@ -45,35 +47,39 @@ def tensor_choice(tens: torch.Tensor, size: int):
 
 @dataclass
 class Mask:
+    """Class to hold an entity/object discovered by an instance segmentation model, and compute useful features"""
     mask: torch.Tensor
     label: str
     confidence: float
 
     # class vars containing model output information
-    priorities: ClassVar[dict[str, int]] = priorities
+    priorities: ClassVar[dict[str, int]] = PRIORITIES
+    category_groups: ClassVar[dict[str, list[str]]] = CATEGORY_GROUPS
     idx_to_sem_class: ClassVar[dict[int, str]] = {idx: cls for (idx, cls) in enumerate(WEIGHTS.meta["categories"])}
 
     @property
     def area(self) -> float:
+        """Computes the (probabilistic mean) area of the entity/object, as a fraction of the full image"""
         return float(self.mask.sum() / (self.mask.shape[-1] * self.mask.shape[-2]))
 
     @property
     def center(self) -> tuple[float, float]:
+        """Computes the center of the entity/object in the image, where width and height are the fraction of the images
+        total width and height, and so are between 0 and 1"""
         indices = (-1, -2)
         center = tuple(float(
             (self.mask.mean(other_index) * torch.arange(0, self.mask.shape[index], device=self.mask.device) /
              self.mask.shape[
                  index]).sum() / self.mask.mean(
                 other_index).sum()) for index, other_index in zip(indices, reversed(indices)))
-        # stop pycharm from complaining about length
-        assert len(center) == 2
         return center
 
     @property
     def priority(self) -> float:
-        for category_name, subcategories in category_groups.items():
+        """Checks if the entity  """
+        for category_name, subcategories in self.category_groups.items():
             if self.label in subcategories:
-                return priorities[category_name]
+                return self.priorities[category_name]
         else:
             # if the for loop finishes without break, ie if no priority is found
             return float("inf")
@@ -113,6 +119,7 @@ class MaskList(list):
                 lower bound
 
         Returns:
+            A Mask sublist of the original list representing the objects which are likely important
 
         """
         # Highly peripheral objects are unlikely to be the goal even if they are high priority objects

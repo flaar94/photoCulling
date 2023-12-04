@@ -20,7 +20,6 @@ import logging
 import sys
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights, maskrcnn_resnet50_fpn_v2
 from torch.utils.data import Dataset, DataLoader
-from typing import Callable
 
 # This is the maximum number of pictures that will be fed into the VGG-based models at once. Should be small enough to
 # not use 8GB of VRAM, but you can make it smaller if running into memory problems, or increase it if you want to try
@@ -35,6 +34,7 @@ IMAGE_DIMS = 224
 
 
 class TypedNamespace(argparse.Namespace):
+    """Stub-like class whose purpose is just to give the 'args' Namespace intelliSense"""
     image_path: str
     model_path: str
     predictions: str
@@ -43,9 +43,11 @@ class TypedNamespace(argparse.Namespace):
     time_threshold: int
     silence: bool
     model_mix: bool
+    weights: list[float]
 
 
 def get_parser():
+    """Sets up the CLI argument parser"""
     parser = argparse.ArgumentParser()
     parser.add_argument('--image_path', type=str, required=True, help='path to file or folder containing images')
     parser.add_argument('--model_path', type=str, default="model_weights/filtered_v4_epoch-35.pth",
@@ -72,6 +74,11 @@ def get_parser():
 
 
 class ImageDataset(Dataset):
+    """
+    PyTorch dataset for loading and processing images using PIL
+    """
+    image_paths: list[Path]
+    transform: callable
     def __init__(self, image_paths: Iterable[Path], transform=None):
         self.image_paths = list(image_paths)
         self.transform = transform
@@ -96,13 +103,24 @@ def extract_top_scored(group: Iterable[Path], scores: dict[Path, float]) -> Path
     return max(group, key=lambda path: scores[path])
 
 
-def flatten_batches(batches: Iterable[torch.Tensor]):
+def flatten_batches(batches: Iterable[torch.Tensor]) -> Iterable[torch.Tensor]:
+    """Takes a list or other iterable of batched model outputs, and flattens them"""
     return (item for batch in batches for item in batch)
 
 
 def apply_model_to_paths(model: nn.Module,
                          image_paths: Iterable[Path],
-                         transform: Callable = None) -> dict[Path, torch.Tensor]:
+                         transform: callable = None) -> dict[Path, torch.Tensor]:
+    """
+    Takes an arbitrary pytorch module, and applies it each image in the image_path list
+    Args:
+        model: the PyTorch module, which will apply its __call__ function to each batch of images
+        image_paths: the list or other iterable of paths to the images
+        transform: the preprocessing operation expected by the PyTorch module
+        (eg: converting to a tensor, normalization, etc...)
+    Returns: dictionary mapping each image path to the model output (eg: a numerical score for NIMA, or
+        tensor features for VGG-16)
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     image_dataset = ImageDataset(image_paths, transform=transform)
@@ -119,7 +137,17 @@ def apply_model_to_paths(model: nn.Module,
     return {image_path: model_output for image_path, model_output in zip(image_paths, flattened_tensors)}
 
 
-def extract_time_metadata(image_paths) -> dict[Path, datetime.datetime]:
+def extract_time_taken_metadata(image_paths: Iterable[Path]) -> dict[Path, datetime.datetime]:
+    """
+    Grabs the time the picture was taken from the metadata. If it isn't available, the date/time will be given a
+    placeholder value (0001-01-01 00:00:00). In this way, photos without this piece of metadata can be grouped with each
+    other purely using model features
+
+    Args:
+        image_paths: the paths to each image
+
+    Returns: A dictionary mapping each image path to its metadata DateTime, hopefully the time taken.
+    """
     photo_capture_times = {}
     for image_path in image_paths:
         image = Image.open(image_path)
@@ -177,8 +205,12 @@ def get_evaluation_model(weight_path: Path | str) -> tuple[NIMAMean, callable]:
     """
     Sets up the model used to evaluate photo quality
 
-    :param weight_path: path to the filed containing the weights for the pretrained model
-    :return: the NIMA model with loaded weights
+    Args:
+        weight_path: path to the filed containing the weights for the pretrained model
+
+    Returns: Tuple of the  model and a transform
+        model: the direction evaluation NIMA module, trained on human ratings
+        transform: that preprocesses the data into something the model will understand
     """
     # These weights will get overwritten, but it's actually faster to load them, I guess due to weight initialization
     weights = models.VGG16_Weights.IMAGENET1K_V1
@@ -204,7 +236,14 @@ def get_evaluation_model(weight_path: Path | str) -> tuple[NIMAMean, callable]:
     return model, nima_transform
 
 
-def get_feature_model() -> tuple[models.VGG, callable]:
+def get_feature_model() -> tuple[nn.Module, callable]:
+    """
+    Function for loading and setting up a VGG-16 module, and its transforms
+
+    :return: Tuple of a model and a transform
+        model: the feature calculating VGG-16 module
+        transform: callable that preprocesses the data into something the model will understand
+    """
     weights = models.VGG16_Weights.IMAGENET1K_V1
     feature_model = models.vgg16(weights=weights)
     feature_model.to("cuda" if torch.cuda.is_available() else "cpu")
@@ -298,7 +337,7 @@ def main():
         feature_model, feature_transforms = get_feature_model()
         image_features = apply_model_to_paths(feature_model, image_paths, transform=feature_transforms)
 
-        time_metadata = extract_time_metadata(image_paths)
+        time_metadata = extract_time_taken_metadata(image_paths)
         logging.info("Image features extracted, now grouping images")
         groups = group_by_features(image_features,
                                    time_metadata,
