@@ -20,6 +20,7 @@ import logging
 import sys
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights, maskrcnn_resnet50_fpn_v2
 from torch.utils.data import Dataset, DataLoader
+import json
 
 # This is the maximum number of pictures that will be fed into the VGG-based models at once. Should be small enough to
 # not use 8GB of VRAM, but you can make it smaller if running into memory problems, or increase it if you want to try
@@ -43,6 +44,16 @@ class TypedNamespace(argparse.Namespace):
     silence: bool
     model_mix: bool
     weights: list[float]
+
+    area_ideal_range: list[float]
+
+    ideal_object_center: list[float]
+    centered_error_buffer: float
+
+    full_image_sharpness: bool
+    sharpness_method: str
+    sharpness_exponent: float
+    sharpness_quantile: float
 
 
 def get_parser():
@@ -69,7 +80,54 @@ def get_parser():
                         help="Explicit set of 5 space separated weights. Overrides model_mix. Eg: '0.1 1 1 1 2.5'. Order"
                              "of weights NIMA, area_score, centered_score, object_type_score, sharpness_score. Still "
                              "in development.")
+
+    # Various parameters used in computing scores
+    parser.add_argument("--area_ideal_range", default=[0.3, 0.8], nargs=2, type=float,
+                        help="Range of object areas (as a fraction of total image area) which cause 0 error")
+    parser.add_argument("--ideal_object_center", default=[0.5, 0.5], nargs=2, type=float,
+                        help="The center of the region of (average) object positions that produce 0 error. \n"
+                             "Positions as a fraction of area width/height, so should be between 0 and 1. \n"
+                             "Position given as (x,y), left to right, bottom to top")
+    parser.add_argument("--centered_error_buffer", default=0.1, type=float,
+                        help="How far the (average) object center is allowed to be from the ideal_object_center while "
+                             "still giving 0 error")
+    parser.add_argument("--full_image_sharpness", action='store_true',
+                        help="Whether to compute the sharpness on the full image (as opposed to only primary detected "
+                             "objects)"
+                        )
+    parser.add_argument("--sharpness_method",
+                        default="quantile_mean",
+                        choices=["quantile_mean", "central_moment"],
+                        help="Approach to aggregating pixel-wise sharpness to compute overall object/image sharpness")
+    parser.add_argument("--sharpness_exponent",
+                        default=4.,
+                        type=float,
+                        help="Exponent used in aggregating pixel-wise sharpness")
+    parser.add_argument("--sharpness_quantile",
+                        default=0.995,
+                        type=float,
+                        help="Fraction of pixel-points with smallest sharpness that are ignored during aggregation")
+
     return parser
+
+
+def extract_score_kwargs(args: TypedNamespace):
+    score_kwargs = {
+        "area_kwargs": {
+            "ideal_range": args.area_ideal_range
+        },
+        "centered_kwargs": {
+            "ideal_object_center": args.ideal_object_center,
+            "error_buffer": args.centered_error_buffer
+        },
+        "sharpness_kwargs": {
+            "full_image_sharpness": args.full_image_sharpness,
+            "method": args.sharpness_method,
+            "p": args.sharpness_exponent,
+            "quantile": args.sharpness_quantile,
+        }
+    }
+    return score_kwargs
 
 
 class ImageDataset(Dataset):
@@ -247,7 +305,11 @@ def get_feature_model() -> tuple[nn.Module, callable]:
     return feature_model.features, weights.transforms()
 
 
-def segmentation_score_paths(image_paths: Iterable[Path]) -> dict[Path, SegmentationScores]:
+def segmentation_score_paths(image_paths: Iterable[Path],
+                             area_kwargs: dict[str, any] | None = None,
+                             centered_kwargs: dict[str, any] | None = None,
+                             sharpness_kwargs: dict[str, any] | None = None
+                             ) -> dict[Path, SegmentationScores]:
     segmentation_weights = MaskRCNN_ResNet50_FPN_V2_Weights.COCO_V1
     segmentation_model = maskrcnn_resnet50_fpn_v2(weights=segmentation_weights)
     segmentation_transforms = segmentation_weights.transforms()
@@ -262,7 +324,10 @@ def segmentation_score_paths(image_paths: Iterable[Path]) -> dict[Path, Segmenta
         with torch.no_grad():
             output = segmentation_model(image_tensor.unsqueeze(0))
         mask_list = MaskList.from_model_output(output[0]).select_top_masks()
-        scores[image_path] = mask_list.scores(image_tensor)
+        scores[image_path] = mask_list.scores(image_tensor,
+                                              area_kwargs=area_kwargs,
+                                              centered_kwargs=centered_kwargs,
+                                              sharpness_kwargs=sharpness_kwargs)
     return scores
 
 
@@ -305,7 +370,7 @@ def main(argv=None):
         nima_scores = defaultdict(int)
 
     if any(weight > 0 for weight in weights[1:]):
-        segmentation_scores = segmentation_score_paths(image_paths)
+        segmentation_scores = segmentation_score_paths(image_paths, **extract_score_kwargs(args))
     else:
         # if no relevant weights, we just grab a dictionary that returns zeros
         segmentation_scores: dict[Path, SegmentationScores] = defaultdict(lambda: SegmentationScores(0, 0, 0, 0))

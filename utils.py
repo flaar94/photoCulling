@@ -50,8 +50,10 @@ def weighted_quantile_mean(x: torch.Tensor, weight: torch.Tensor | None = None, 
     return float(quantile_mean)
 
 
-def weighted_central_root_moment(x: torch.Tensor, weight: torch.Tensor | None = None, p: float = 4,
-                                    quantile: float = 0.995):
+def weighted_central_root_moment(x: torch.Tensor,
+                                 weight: torch.Tensor | None = None,
+                                 p: float = 4,
+                                 quantile: float = 0.995):
     if weight is None:
         weight = torch.ones_like(x)
 

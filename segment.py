@@ -1,4 +1,4 @@
-from typing import Self, ClassVar, NamedTuple
+from typing import Self, ClassVar, NamedTuple, Callable
 from dataclasses import dataclass
 import math
 from operator import mul
@@ -56,13 +56,15 @@ class Mask:
     @property
     def center(self) -> tuple[float, float]:
         """Computes the center of the entity/object in the image, where width and height are the fraction of the images
-        total width and height, and so are between 0 and 1"""
-        indices = (-1, -2)
-        center = tuple(float(
-            (self.mask.mean(other_index) * torch.arange(0, self.mask.shape[index], device=self.mask.device) /
-             self.mask.shape[
-                 index]).sum() / self.mask.mean(
-                other_index).sum()) for index, other_index in zip(indices, reversed(indices)))
+        total width and height, and so are between 0 and 1
+        Note: ((x,y) measured from bottom left of image, left to right, bottom to top)"""
+
+        center = (
+            float((self.mask.mean(-2) * torch.arange(0, self.mask.shape[-1], device=self.mask.device) /
+                   self.mask.shape[-1]).sum() / self.mask.mean(-2).sum()),
+            1 - float((self.mask.mean(-1) * torch.arange(0, self.mask.shape[-2], device=self.mask.device) /
+             self.mask.shape[-2]).sum() / self.mask.mean(-1).sum())
+        )
         return center
 
     @property
@@ -159,8 +161,9 @@ class MaskList(list):
         """
         Computes how much an objects area differs from the ideal range.
 
-        Note: our piecewise choice of metrics may look a bit strange. For areas greater than the upper bound, the raw area is probably fine, but for the lower bound, we use a log scale.
-        This is because I think a discrepancy of 0.2 isn't much if we're going from 0.5 to 0.3, but it is huge if we're going from 0.21 to 0.01.
+        Note: our piecewise choice of metrics may look a bit strange. For areas greater than the upper bound, the raw
+        area is probably fine, but for the lower bound, we use a log scale. This is because I think a discrepancy of 0.2
+        isn't much if we're going from 0.5 to 0.3, but it is huge if we're going from 0.21 to 0.01.
 
         :param ideal_range: tuple of floats. Any total areas within this range will result in an error of 0.
         :param eps: regularization parameter. Roughly like the fraction of the image that we consider very bad,
@@ -178,11 +181,15 @@ class MaskList(list):
         else:
             return 0
 
-    def centered_error(self, ideal_object_center=(0.5, 0.6), error_buffer=0.1) -> float:
+    def mask_weighted_average(self, value_fn: Callable[[Mask], float]) -> float:
+        """Computes a weighted average of some values calculated from a mask, eg: an attribute via lambda x:x.my_attr"""
+        return sum([value_fn(mask) * mask.confidence * mask.area for mask in self]) / sum(
+            [mask.confidence * mask.area for mask in self])
+
+    def centered_error(self, ideal_object_center=(0.5, 0.5), error_buffer=0.1) -> float:
         """
         Computes how much the center of objects differs from the center. We use L1 distance based on the assumption that
-        diagonal distance is particularly bad. I've set the ideal center slightly to the right since the internet
-        tells me right-side composition is more common.
+        diagonal distance is particularly bad
 
         :param ideal_object_center: the ideal center of the object
         :param error_buffer: how far from the ideal_center the object is allowed to be without taking a penalty
@@ -192,22 +199,22 @@ class MaskList(list):
         """
         if not self:
             return 1.
-        weighted_center = [sum([mask.center[i] * mask.confidence * mask.area for mask in self]) / sum(
-            [mask.confidence * mask.area for mask in self]) for i in range(2)]
+        weighted_center = (self.mask_weighted_average(lambda mask: mask.center[0]),
+                           self.mask_weighted_average(lambda mask: mask.center[1]))
         return max(abs(ideal_object_center[0] - weighted_center[0]) - error_buffer, 0) + \
             max(abs(ideal_object_center[1] - weighted_center[1]) - error_buffer, 0)
 
-    def priority_error(self):
+    def object_type_error(self):
         """
         Computes a weighted average of the priority of objects in the MaskList, as a fraction of max priority
         """
         if not self:
             return 1.
-        weighted_priority_mean = sum([mask.priority * mask.confidence * mask.area for mask in self]) / sum([mask.confidence * mask.area for mask in self])
+        weighted_priority_mean = self.mask_weighted_average(lambda mask: mask.priority)
         return weighted_priority_mean / max(Mask.priorities.values())
 
     def object_sharpness(self, image: torch.Tensor, method: str = "quantile_mean",
-                         p: float = 4, quantile: float = 0.995) -> float:
+                         p: float = 4, quantile: float = 0.995, full_image_sharpness: bool = False) -> float:
         """
         Computes the sharpness of an image on the region of image determined by our mask (eg: an object)
 
@@ -215,15 +222,16 @@ class MaskList(list):
         :param method: A robust estimate of the maximum used to aggregate pointwise image sharpness
         :param p: Parameter in maximum estimate functions -- exponent used in calculation
         :param quantile: Parameter in maximum estimate functions -- the fraction of smaller values to ignore
+        :param full_image_sharpness: ignore the mask and just computes (robust max) sharpness on the full image
         :return: A float estimating the sharpness of the image on that object's sharpest places
         """
         truncated_sharpness = self.pointwise_sharpness(image)
         # Ignore the boundary pixels which are affected by padding
-        if self:
-            truncated_mask = self.merge()[1:-1, 1:-1]
-        else:
-            # If there are no detected objects, it defaults to full image sharpness
+        if full_image_sharpness or not self:
+            # If the list of masks is empty, ie there are no detected objects, it defaults to full image sharpness
             truncated_mask = None
+        else:
+            truncated_mask = self.merge()[1:-1, 1:-1]
 
         if method == "central_moment":
             return weighted_central_root_moment(truncated_sharpness, truncated_mask, p=p, quantile=quantile)
@@ -232,15 +240,28 @@ class MaskList(list):
         else:
             raise NotImplementedError(f"{method=} has not been implemented, please use one of ['central_moment']")
 
-    def scores(self, image: torch.tensor) -> SegmentationScores:
+    def scores(self, image: torch.tensor,
+               area_kwargs: dict[str, any] | None = None,
+               centered_kwargs: dict[str, any] | None = None,
+               sharpness_kwargs: dict[str, any] | None = None
+               ) -> SegmentationScores:
         """
         Thin wrapper for the 4 primary scores coming from this class
 
         :param image: the original image
+        :param area_kwargs: arguments to pass into the area_error method
+        :param centered_kwargs: arguments to pass into the centered_error method
+        :param sharpness_kwargs: arguments to pass into the object_sharpness method
         :return: A named tuple containing the different scores
         """
-        return SegmentationScores(area_score=1 - self.area_error(),
-                                  centered_score=1 - self.centered_error(),
-                                  object_type_score=1 - self.priority_error(),
-                                  sharpness_score=self.object_sharpness(image)
+        if area_kwargs is None:
+            area_kwargs = {}
+        if centered_kwargs is None:
+            centered_kwargs = {}
+        if sharpness_kwargs is None:
+            sharpness_kwargs = {}
+        return SegmentationScores(area_score=1 - self.area_error(**area_kwargs),
+                                  centered_score=1 - self.centered_error(**centered_kwargs),
+                                  object_type_score=1 - self.object_type_error(),
+                                  sharpness_score=self.object_sharpness(image, **sharpness_kwargs)
                                   )
