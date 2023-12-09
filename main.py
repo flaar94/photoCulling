@@ -73,7 +73,7 @@ def get_parser():
                              'number')
     parser.add_argument("--silence", action='store_true',
                         help="Whether to prevent the script from printing out its updates as it's running")
-    parser.add_argument("--model_mix", default="nima",
+    parser.add_argument("--model_mix", default="uniform",
                         choices=["nima", "uniform", "uniform_seg", "sharpness"],
                         help="Which models/scores to use to make predictions")
     parser.add_argument("--weights", default=None, required=False, nargs=5, type=float,
