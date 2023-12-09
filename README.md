@@ -42,16 +42,16 @@ python -m main --image_path samples --weights 0 1 2.7 3.14 0.01
 
 The order of weights is 
 1. NIMA - direct model scoring, trained on human ratings of photos
-2. area_score - how close the primary objects are to taking up an area in the chosen range
+2. area_score - how close the primary objects are to taking up an area in the chosen range.
          Defaults to range being 0.3 to 0.8 of the image, but can be modified by the `--area_ideal_range` option.
        eg: `python -m main  --image_path samples --area_ideal_range 0.1 0.9`
        means: as long as the objects take up 10% - 90% of the image it will receive the maximum area score
-4. centered_score - how close center of the collection of primary objects is to the chosen center
+4. centered_score - how close center of the collection of primary objects is to the chosen center. 
          Defaults to chosen center being (0.5, 0.5), with a error margin of 0.1, but these can be changed with options `--ideal_object_center` and `--centered_error_buffer`.
          eg: `python -m main --image_path samples --ideal_object_center 0.6 0.4 --centered_error_buffer 0.`
-         means: no error if the average of object centers is exactly at (0.6, 0.4), ie slightly to the right and slightly lower than center
+         means: no error if the average of object centers is exactly at (0.6, 0.4), ie slightly to the right and slightly lower than center.
 6. object_type_score - priority of the type of object in the image. (Temporarily hard coded as: person=animal>food>vehicle>object>background/background-like-objects like tables)
-7. sharpness_score - sharpness of primary objects in the image, defaulting to overall image sharpness if no suitable object is found
+7. sharpness_score - sharpness of primary objects in the image, defaulting to overall image sharpness if no suitable object is found.
           Primary variant option is `--full_image_sharpness` which ignores the object segmentation, and just computes the sharpness on the full image.
           eg: `python -m main --image_path samples --full_image_sharpness`
           Additional parameters are `--sharpness_method`, `--sharpness_exponent`, `--sharpness_quantile` which adjust how pixel-wise sharpness is aggregated into a single number.
