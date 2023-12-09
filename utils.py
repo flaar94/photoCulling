@@ -6,12 +6,6 @@ import torch
 
 MAX_QUANTILE_TENSOR_SIZE = 2 ** 24
 
-
-def sigmoid(x):
-    """Classic squashing function"""
-    return 1 / (1 + math.exp(-x))
-
-
 def robust_quantile(x, q, *args, **kwargs):
     """Wrapper for torch.quantile to handle images that are too big for it to compute"""
     if x.shape[0] > MAX_QUANTILE_TENSOR_SIZE:

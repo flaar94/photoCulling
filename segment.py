@@ -6,27 +6,27 @@ from functools import reduce
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights
 import torch
 
-from utils import sigmoid, weighted_quantile_mean, weighted_central_root_moment
+from utils import weighted_quantile_mean, weighted_central_root_moment
 
 LAPLACE_KERNEL = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=torch.float32,
                               requires_grad=False).unsqueeze(0).unsqueeze(0) / 6.
 
-animals = ["cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"]
-vehicles = ["bicycle", "car", "motorcycle", "airplane", "bus", "truck", "boat"]
-food = ["banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake"]
-objects = ["traffic light", "stop sign", "parking meter", "fire hydrant", "wine glass", "cup", "fork", "knife", "spoon",
+animals = ("cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe")
+vehicles = ("bicycle", "car", "motorcycle", "airplane", "bus", "truck", "boat")
+food = ("banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake")
+objects = ("traffic light", "stop sign", "parking meter", "fire hydrant", "wine glass", "cup", "fork", "knife", "spoon",
            "bowl", "potted plant", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven",
            "toaster", "toilet", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
            "frisbee", "skis", "snowboard", "sportsball", "kite", "baseball bat", "baseball glove", "skateboard",
-           "surfboard", "tennis racket", "backpack", "umbrella", "handbag", "tie", "suitcase"]
-mediums = ["bed", "dining table", "sink", "refrigerator", "chair", "bench"]
-misc = ["__background__", "N/A"]
+           "surfboard", "tennis racket", "backpack", "umbrella", "handbag", "tie", "suitcase")
+mediums = ("bed", "dining table", "sink", "refrigerator", "chair", "bench")
+misc = ("__background__", "N/A")
 CATEGORY_GROUPS = {"person": ["person"], "animal": animals, "vehicle": vehicles, "food": food, "object": objects,
                    "medium": mediums, "misc": misc}
 
 PRIORITIES = {"person": 2, "animal": 2, "food": 3, "vehicle": 4, "object": 5, "medium": 6, "misc": 6}
 
-WEIGHTS = MaskRCNN_ResNet50_FPN_V2_Weights.COCO_V1
+SEGMENTATION_MODEL_CATEGORIES = tuple(MaskRCNN_ResNet50_FPN_V2_Weights.COCO_V1.meta["categories"])
 
 
 class SegmentationScores(NamedTuple):
@@ -47,7 +47,6 @@ class Mask:
     # class vars containing model output information
     priorities: ClassVar[dict[str, int]] = PRIORITIES
     category_groups: ClassVar[dict[str, list[str]]] = CATEGORY_GROUPS
-    idx_to_sem_class: ClassVar[dict[int, str]] = {idx: cls for (idx, cls) in enumerate(WEIGHTS.meta["categories"])}
 
     @property
     def area(self) -> float:
@@ -68,13 +67,13 @@ class Mask:
 
     @property
     def priority(self) -> float:
-        """Checks if the entity  """
+        """Checks if the entity's category is in the priority list, if so uses the value, otherwise gives max possible"""
         for category_name, subcategories in self.category_groups.items():
             if self.label in subcategories:
                 return self.priorities[category_name]
         else:
             # if the for loop finishes without break, ie if no priority is found
-            return float("inf")
+            return max(self.priorities.values())
 
     def _effective_priority(self, area_threshold):
         return self.priority if self.area > area_threshold else self.priority + 1
@@ -93,7 +92,7 @@ class MaskList(list):
         :param score_threshold: A lower bound on the score when determining which masks to keep
         :return: A MaskList containing the information from the segmentation model output
         """
-        return cls((Mask(mask, Mask.idx_to_sem_class[int(label)], float(score)) for mask, label, score in
+        return cls((Mask(mask, SEGMENTATION_MODEL_CATEGORIES[int(label)], float(score)) for mask, label, score in
                     zip(model_output["masks"], model_output["labels"], model_output["scores"]) if
                     score > score_threshold))
 
@@ -199,10 +198,13 @@ class MaskList(list):
             max(abs(ideal_object_center[1] - weighted_center[1]) - error_buffer, 0)
 
     def priority_error(self):
+        """
+        Computes a weighted average of the priority of objects in the MaskList, as a fraction of max priority
+        """
         if not self:
             return 1.
-        return sigmoid(sum([mask.priority * mask.confidence * mask.area for mask in self]) / sum(
-            [mask.confidence * mask.area for mask in self])) - 0.5
+        weighted_priority_mean = sum([mask.priority * mask.confidence * mask.area for mask in self]) / sum([mask.confidence * mask.area for mask in self])
+        return weighted_priority_mean / max(Mask.priorities.values())
 
     def object_sharpness(self, image: torch.Tensor, method: str = "quantile_mean",
                          p: float = 4, quantile: float = 0.995) -> float:
