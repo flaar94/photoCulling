@@ -5,13 +5,11 @@ from operator import mul
 from functools import reduce
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights
 import torch
-import warnings
-import numpy as np
+
+from utils import sigmoid, weighted_quantile_mean, weighted_central_root_moment
 
 LAPLACE_KERNEL = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=torch.float32,
                               requires_grad=False).unsqueeze(0).unsqueeze(0) / 6.
-
-MAX_QUANTILE_TENSOR_SIZE = 2 ** 24
 
 animals = ["cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"]
 vehicles = ["bicycle", "car", "motorcycle", "airplane", "bus", "truck", "boat"]
@@ -37,12 +35,6 @@ class SegmentationScores(NamedTuple):
     centered_score: float
     object_type_score: float
     sharpness_score: float
-
-
-def tensor_choice(tens: torch.Tensor, size: int):
-    """Randomly selects 'size' entries from a torch tensor. Uses numpy due to size constraints for torch."""
-    idx = np.random.default_rng().choice(tens.view(-1).shape[0], size, replace=False)
-    return tens[idx]
 
 
 @dataclass
@@ -91,13 +83,16 @@ class Mask:
         return f"(Mask {self.label}, area={self.area:.3f}, center=({self.center[0]:.3f}, {self.center[1]:.3f}), confidence={self.confidence:.3f})"
 
 
-def sigmoid(x):
-    return 1 / (1 + math.exp(-x))
-
-
 class MaskList(list):
     @classmethod
     def from_model_output(cls, model_output: dict, score_threshold: float = 0.5) -> Self:
+        """
+        Takes the raw output of a PyTorch segmentation model on a single image, and creates a MaskList
+
+        :param model_output: Raw output of a pytorch segmentation model
+        :param score_threshold: A lower bound on the score when determining which masks to keep
+        :return: A MaskList containing the information from the segmentation model output
+        """
         return cls((Mask(mask, Mask.idx_to_sem_class[int(label)], float(score)) for mask, label, score in
                     zip(model_output["masks"], model_output["labels"], model_output["scores"]) if
                     score > score_threshold))
@@ -108,20 +103,17 @@ class MaskList(list):
         Filters the mask list so it (hopefully) only contains important objects, using heuristics for determining which
         objects in the picture are what people are actually trying to display.
 
-        Args:
-            peripheral_threshold: how close to each side the object's center is allowed to be as a fraction of the image
+        :param peripheral_threshold: how close to each side the object's center is allowed to be as a fraction of the image
                 size (0, 1)
-            area_multiplier: If an object of priority one less than the max exists, it is ignored unless its area is
+        :param area_multiplier: If an object of priority one less than the max exists, it is ignored unless its area is
                 area_multiplier times as large as the higher priority objects.
                 Also used to divide the largest area to determine the lower bound on the area of masks we will keep
-            priority_adjustment: Used to adjust the lower bound on the area of masks we keep. In particular, masks of
+        :param priority_adjustment: Used to adjust the lower bound on the area of masks we keep. In particular, masks of
                 higher priority will be included if priority_adjustment * (their area) is larger than the unadjusted
                 lower bound
-
-        Returns:
-            A Mask sublist of the original list representing the objects which are likely important
-
+        :return: A Mask sublist of the original list representing the objects which are likely important
         """
+
         # Highly peripheral objects are unlikely to be the goal even if they are high priority objects
         non_peripheral_masks = [mask for mask in self if all(
             peripheral_threshold <= position <= 1 - peripheral_threshold for position in mask.center)]
@@ -164,41 +156,6 @@ class MaskList(list):
                                                weight=LAPLACE_KERNEL.to(image.device)).squeeze().sum(dim=0)
         return pointwise_sharpness
 
-    @staticmethod
-    def weighted_central_root_moment(x, weight=None, p=4, quantile=0.995):
-        if weight is None:
-            weight = torch.ones_like(x)
-
-        weighted_mean = (x * weight).sum() / weight.sum()
-
-        if quantile:
-            # If quantile > 0 we only consider the pixels greater than the quantile, hopefully corresponding to transition areas/edges
-            quantile_value = torch.quantile(x[weight >= 0.5].view(-1), q=quantile)
-            x, weight = x[x >= quantile_value], weight[x >= quantile_value]
-
-        return float((((x - weighted_mean) ** p * weight).sum() / weight.sum()) ** (1 / p))
-
-    @staticmethod
-    def weighted_quantile_mean(x, weight=None, p=1, quantile=0.995):
-        if weight is None:
-            weight = torch.ones_like(x)
-
-        if quantile:
-            # If quantile > 0 we only consider the pixels greater than the quantile, hopefully corresponding to transition areas/edges
-            x_flat = x[weight >= 0.5].view(-1)
-            if x_flat.shape[0] > MAX_QUANTILE_TENSOR_SIZE:
-                warnings.warn("Image is too big for torch.quantile (> 2^24 ~=17 million pixels). Taking "
-                              "a sample of points to check sharpness instead of entire image.",
-                              RuntimeWarning,
-                              stacklevel=2)
-                x_flat = tensor_choice(x_flat, MAX_QUANTILE_TENSOR_SIZE)
-            quantile_value = torch.quantile(x_flat, q=quantile)
-            x, weight = x[x >= quantile_value], weight[x >= quantile_value]
-
-        weighted_mean = (weight * x ** p).sum() / weight.sum()
-
-        return float(weighted_mean ** (1 / p))
-
     def area_error(self, ideal_range: tuple[float, float] = (0.3, 0.8), eps=0.01) -> float:
         """
         Computes how much an objects area differs from the ideal range.
@@ -206,13 +163,10 @@ class MaskList(list):
         Note: our piecewise choice of metrics may look a bit strange. For areas greater than the upper bound, the raw area is probably fine, but for the lower bound, we use a log scale.
         This is because I think a discrepancy of 0.2 isn't much if we're going from 0.5 to 0.3, but it is huge if we're going from 0.21 to 0.01.
 
-        Args:
-            ideal_range: tuple of floats. Any total areas within this range will result in an error of 0.
-            eps: regularization parameter. Roughly like the fraction of the image that we consider very bad,
-                and making it even smaller doesn't increase the error by much
-
-        Returns: float between 0 and 1
-
+        :param ideal_range: tuple of floats. Any total areas within this range will result in an error of 0.
+        :param eps: regularization parameter. Roughly like the fraction of the image that we consider very bad,
+                    and making it even smaller doesn't increase the error by much
+        :return: float between 0 and 1
         """
         if not self:
             return 1.
@@ -225,19 +179,17 @@ class MaskList(list):
         else:
             return 0
 
-    def center_error(self, ideal_object_center=(0.5, 0.6), error_buffer=0.1) -> float:
+    def centered_error(self, ideal_object_center=(0.5, 0.6), error_buffer=0.1) -> float:
         """
         Computes how much the center of objects differs from the center. We use L1 distance based on the assumption that
         diagonal distance is particularly bad. I've set the ideal center slightly to the right since the internet
         tells me right-side composition is more common.
 
-        Args:
-            ideal_object_center: the ideal center of the object
-            error_buffer: how far from the ideal_center the object is allowed to be without taking a penalty
+        :param ideal_object_center: the ideal center of the object
+        :param error_buffer: how far from the ideal_center the object is allowed to be without taking a penalty
                 Note: the buffer zone is a diamond, not a flat square
-
-        Returns: float between 0 and 1
-
+        :return:
+                float between 0 and 1
         """
         if not self:
             return 1.
@@ -252,7 +204,17 @@ class MaskList(list):
         return sigmoid(sum([mask.priority * mask.confidence * mask.area for mask in self]) / sum(
             [mask.confidence * mask.area for mask in self])) - 0.5
 
-    def object_sharpness(self, image: torch.Tensor, method="quantile_mean", p=4, quantile=0.995):
+    def object_sharpness(self, image: torch.Tensor, method: str = "quantile_mean",
+                         p: float = 4, quantile: float = 0.995) -> float:
+        """
+        Computes the sharpness of an image on the region of image determined by our mask (eg: an object)
+
+        :param image: The image tensor
+        :param method: A robust estimate of the maximum used to aggregate pointwise image sharpness
+        :param p: Parameter in maximum estimate functions -- exponent used in calculation
+        :param quantile: Parameter in maximum estimate functions -- the fraction of smaller values to ignore
+        :return: A float estimating the sharpness of the image on that object's sharpest places
+        """
         truncated_sharpness = self.pointwise_sharpness(image)
         # Ignore the boundary pixels which are affected by padding
         if self:
@@ -262,9 +224,9 @@ class MaskList(list):
             truncated_mask = None
 
         if method == "central_moment":
-            return self.weighted_central_root_moment(truncated_sharpness, truncated_mask, p=p, quantile=quantile)
-        if method == "quantile_mean":
-            return self.weighted_quantile_mean(truncated_sharpness, truncated_mask, p=p, quantile=quantile)
+            return weighted_central_root_moment(truncated_sharpness, truncated_mask, p=p, quantile=quantile)
+        elif method == "quantile_mean":
+            return weighted_quantile_mean(truncated_sharpness, truncated_mask, p=p, quantile=quantile)
         else:
             raise NotImplementedError(f"{method=} has not been implemented, please use one of ['central_moment']")
 
@@ -273,10 +235,10 @@ class MaskList(list):
         Thin wrapper for the 4 primary scores coming from this class
 
         :param image: the original image
-        :return:
+        :return: A named tuple containing the different scores
         """
         return SegmentationScores(area_score=1 - self.area_error(),
-                                  centered_score=1 - self.center_error(),
+                                  centered_score=1 - self.centered_error(),
                                   object_type_score=1 - self.priority_error(),
                                   sharpness_score=self.object_sharpness(image)
                                   )

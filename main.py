@@ -32,7 +32,6 @@ BATCH_SIZE = 10
 IMAGE_DIMS = 224
 
 
-
 class TypedNamespace(argparse.Namespace):
     """Stub-like class whose purpose is just to give the 'args' Namespace intelliSense"""
     image_path: str
@@ -79,6 +78,7 @@ class ImageDataset(Dataset):
     """
     image_paths: list[Path]
     transform: callable
+
     def __init__(self, image_paths: Iterable[Path], transform=None):
         self.image_paths = list(image_paths)
         self.transform = transform
@@ -113,12 +113,12 @@ def apply_model_to_paths(model: nn.Module,
                          transform: callable = None) -> dict[Path, torch.Tensor]:
     """
     Takes an arbitrary pytorch module, and applies it each image in the image_path list
-    Args:
-        model: the PyTorch module, which will apply its __call__ function to each batch of images
-        image_paths: the list or other iterable of paths to the images
-        transform: the preprocessing operation expected by the PyTorch module
+
+    :param model: the PyTorch module, which will apply its __call__ function to each batch of images
+    :param image_paths: the list or other iterable of paths to the images
+    :param transform: the preprocessing operation expected by the PyTorch module
         (eg: converting to a tensor, normalization, etc...)
-    Returns: dictionary mapping each image path to the model output (eg: a numerical score for NIMA, or
+    :return: dictionary mapping each image path to the model output (eg: a numerical score for NIMA, or
         tensor features for VGG-16)
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -143,10 +143,8 @@ def extract_time_taken_metadata(image_paths: Iterable[Path]) -> dict[Path, datet
     placeholder value (0001-01-01 00:00:00). In this way, photos without this piece of metadata can be grouped with each
     other purely using model features
 
-    Args:
-        image_paths: the paths to each image
-
-    Returns: A dictionary mapping each image path to its metadata DateTime, hopefully the time taken.
+    :param image_paths: the paths to each image
+    :return: A dictionary mapping each image path to its metadata DateTime, hopefully the time taken.
     """
     photo_capture_times = {}
     for image_path in image_paths:
@@ -168,15 +166,13 @@ def group_by_features(image_features: dict[Path, torch.Tensor],
     """
     Determine pairs of items that are similar in time and VGG features
 
-    Args:
-        image_features: dictionary mapping image paths to computed VGG-16 feature vectors
-        time_metadata: dictionary mapping image paths to extracted image collection times
-        time_threshold: how many minutes between pictures is allowed for two photos to be grouped
-        similarity_threshold: the minimum cosine similarity between photos' base-model features for them to be grouped
-
-    Returns: Set of groups of images that are similar in time and features
-
+    :param image_features: dictionary mapping image paths to computed VGG-16 feature vectors
+    :param time_metadata: dictionary mapping image paths to extracted image collection times
+    :param similarity_threshold: how many minutes between pictures is allowed for two photos to be grouped
+    :param time_threshold: the minimum cosine similarity between photos' base-model features for them to be grouped
+    :return: Set of groups of images that are similar in time and features
     """
+
     similar_images = []
     all_connected_images = set()
     for image_path1, image_path2 in itertools.combinations(image_features.keys(), 2):
@@ -205,13 +201,12 @@ def get_evaluation_model(weight_path: Path | str) -> tuple[NIMAMean, callable]:
     """
     Sets up the model used to evaluate photo quality
 
-    Args:
-        weight_path: path to the filed containing the weights for the pretrained model
-
-    Returns: Tuple of the  model and a transform
+    :param weight_path: path to the filed containing the weights for the pretrained model
+    :return: Tuple of the  model and a transform
         model: the direction evaluation NIMA module, trained on human ratings
         transform: that preprocesses the data into something the model will understand
     """
+
     # These weights will get overwritten, but it's actually faster to load them, I guess due to weight initialization
     weights = models.VGG16_Weights.IMAGENET1K_V1
     base_model = models.vgg16(weights=weights)
@@ -271,9 +266,9 @@ def segmentation_score_paths(image_paths: Iterable[Path]) -> dict[Path, Segmenta
     return scores
 
 
-def main():
+def main(argv=None):
     parser = get_parser()
-    args = parser.parse_args(namespace=TypedNamespace())
+    args = parser.parse_args(args=argv, namespace=TypedNamespace())
 
     logging_level = logging.WARNING if args.silence else logging.INFO
     logging.basicConfig(level=logging_level, stream=sys.stdout, format="%(message)s")
